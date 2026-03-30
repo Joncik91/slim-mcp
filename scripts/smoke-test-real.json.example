@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "my-server-a": {
+      "command": "node",
+      "args": ["/path/to/server-a/dist/index.js"]
+    },
+    "my-server-b": {
+      "command": "node",
+      "args": ["/path/to/server-b/dist/index.js"]
+    }
+  },
+  "compression": "standard"
+}

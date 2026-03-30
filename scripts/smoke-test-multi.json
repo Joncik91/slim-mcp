@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    },
+    "mock": {
+      "command": "npx",
+      "args": ["tsx", "test/e2e/mock-server.ts", "--tools", "20"]
+    }
+  },
+  "compression": "standard"
+}

@@ -1,0 +1,60 @@
+{
+  "name": "slim-mcp",
+  "version": "0.1.0",
+  "description": "MCP proxy that gives agents their context window back. Schema compression, lazy loading, response caching.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "slim-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "prepublishOnly": "npm run build && npm test",
+    "test": "vitest run --exclude 'test/e2e/**'",
+    "test:watch": "vitest --exclude 'test/e2e/**'",
+    "test:e2e": "vitest run test/e2e/ --testTimeout 60000 --fileParallelism=false",
+    "smoke-test": "npx tsx scripts/smoke-test-auto.ts",
+    "smoke-test:setup": "bash scripts/smoke-test.sh",
+    "smoke-test:revert": "bash scripts/smoke-test.sh --revert"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "proxy",
+    "context-window",
+    "token-optimization",
+    "lazy-loading",
+    "schema-compression",
+    "claude-code",
+    "cursor",
+    "cline",
+    "ai-agent",
+    "llm"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Joncik91/mcp-slim"
+  },
+  "homepage": "https://github.com/Joncik91/mcp-slim",
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.28.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.2"
+  }
+}
