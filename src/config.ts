@@ -33,7 +33,7 @@ export interface DashboardConfig {
 
 export interface McpSlimConfig {
   servers: Record<string, ServerConfig>;
-  compression: 'none' | 'standard' | 'aggressive';
+  compression: 'none' | 'standard' | 'aggressive' | 'extreme' | 'maximum';
   cache?: CacheConfig;
   max_tools_loaded?: number;
   lazy_loading?: boolean;
@@ -143,7 +143,7 @@ function parseConfig(raw: unknown, sourcePath: string): McpSlimConfig {
   }
 
   // Validate compression
-  const validCompressions = ['none', 'standard', 'aggressive'] as const;
+  const validCompressions = ['none', 'standard', 'aggressive', 'extreme', 'maximum'] as const;
   type Compression = (typeof validCompressions)[number];
   let compression: Compression = 'standard';
   if ('compression' in obj && obj.compression !== undefined) {

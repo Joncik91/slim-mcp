@@ -7,7 +7,7 @@ import { startDashboard } from './dashboard.js';
 import type { CompressionLevel } from './compress.js';
 import type { TransportType } from './transport/http.js';
 
-const VALID_COMPRESSION_LEVELS: CompressionLevel[] = ['none', 'standard', 'aggressive'];
+const VALID_COMPRESSION_LEVELS: CompressionLevel[] = ['none', 'standard', 'aggressive', 'extreme', 'maximum'];
 const VALID_TRANSPORT_TYPES: TransportType[] = ['http', 'sse'];
 
 interface ParsedArgs {
@@ -135,7 +135,7 @@ Usage:
 
 Options:
   --config <path>        Path to config file (default: auto-discover)
-  --compression <level>  none | standard | aggressive (default: standard)
+  --compression <level>  none | standard | aggressive | extreme | maximum (default: standard)
   --no-cache             Disable response caching
   --no-lazy              Disable lazy loading
   --max-tools <n>        Max tools with full schemas (default: 8)

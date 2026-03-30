@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { compressTools, type CompressionLevel } from '../src/compress.js';
+import { compressTools, formatType, embedSignature, extractSharedParams, type CompressionLevel } from '../src/compress.js';
 
 // Helper to make a minimal valid Tool
 function makeTool(name: string, properties: Record<string, unknown> = {}, extra: Record<string, unknown> = {}): any {
@@ -264,6 +264,151 @@ describe('compressTools', () => {
       // In standard, both keep their descriptions (truncated but not stripped)
       const p2 = (results[1].inputSchema.properties as any).owner;
       expect(p2.description).toBe('Repository owner login');
+    });
+  });
+
+  describe('Stage 4: signature embedding — extreme', () => {
+    it('embeds TS-style signature in description and strips inputSchema', () => {
+      const tool = makeTool('create_issue', {
+        title: { type: 'string' },
+        body: { type: 'string' },
+      }, { description: 'Create a new issue', schemaExtra: { required: ['title'] } });
+
+      const [result] = compressTools([tool], 'extreme');
+      expect(result.description).toContain('Params:');
+      expect(result.description).toContain('title: string (required)');
+      expect(result.description).toContain('body: string');
+      expect(result.inputSchema).toEqual({ type: 'object' });
+    });
+
+    it('formats enum types correctly', () => {
+      const tool = makeTool('set_status', {
+        status: { type: 'string', enum: ['open', 'closed', 'pending'] },
+      });
+
+      const [result] = compressTools([tool], 'extreme');
+      expect(result.description).toContain('"open"|"closed"|"pending"');
+    });
+
+    it('formats array types correctly', () => {
+      const tool = makeTool('add_labels', {
+        labels: { type: 'array', items: { type: 'string' } },
+      });
+
+      const [result] = compressTools([tool], 'extreme');
+      expect(result.description).toContain('labels: string[]');
+    });
+
+    it('formats nested object types', () => {
+      const tool = makeTool('configure', {
+        options: { type: 'object', properties: { limit: { type: 'number' }, offset: { type: 'number' } } },
+      });
+
+      const [result] = compressTools([tool], 'extreme');
+      expect(result.description).toContain('{limit: number?, offset: number?}');
+    });
+
+    it('handles tool with no properties', () => {
+      const tool = makeTool('ping', {}, { description: 'Health check' });
+
+      const [result] = compressTools([tool], 'extreme');
+      expect(result.description).toBe('Health check');
+      expect(result.inputSchema).toEqual({ type: 'object' });
+    });
+
+    it('never modifies tool names', () => {
+      const tool = makeTool('my_tool', { x: { type: 'string' } });
+      const [result] = compressTools([tool], 'extreme');
+      expect(result.name).toBe('my_tool');
+    });
+  });
+
+  describe('Stage 4: signature embedding — maximum', () => {
+    it('uses short type names and ! for required', () => {
+      const tool = makeTool('create_issue', {
+        title: { type: 'string' },
+        count: { type: 'number' },
+        draft: { type: 'boolean' },
+      }, { description: 'Create issue', schemaExtra: { required: ['title', 'count'] } });
+
+      const [result] = compressTools([tool], 'maximum');
+      expect(result.description).toContain('P:');
+      expect(result.description).toContain('title:s!');
+      expect(result.description).toContain('count:n!');
+      expect(result.description).toContain('draft:b');
+      expect(result.description).not.toContain('draft:b!');
+    });
+
+    it('uses s[] for string arrays', () => {
+      const tool = makeTool('tag', {
+        labels: { type: 'array', items: { type: 'string' } },
+      });
+
+      const [result] = compressTools([tool], 'maximum');
+      expect(result.description).toContain('labels:s[]');
+    });
+
+    it('strips inputSchema to { type: "object" }', () => {
+      const tool = makeTool('t', { x: { type: 'string' } });
+      const [result] = compressTools([tool], 'maximum');
+      expect(result.inputSchema).toEqual({ type: 'object' });
+    });
+  });
+
+  describe('formatType', () => {
+    it('returns short type for string', () => {
+      expect(formatType({ type: 'string' }, true)).toBe('s');
+      expect(formatType({ type: 'string' }, false)).toBe('string');
+    });
+
+    it('handles nullable', () => {
+      expect(formatType({ type: 'string', nullable: true }, true)).toBe('s|null');
+      expect(formatType({ type: 'string', nullable: true }, false)).toBe('string|null');
+    });
+
+    it('handles enum', () => {
+      expect(formatType({ enum: ['a', 'b'] }, true)).toBe('"a"|"b"');
+    });
+
+    it('handles anyOf', () => {
+      expect(formatType({ anyOf: [{ type: 'string' }, { type: 'number' }] }, false)).toBe('string|number');
+      expect(formatType({ anyOf: [{ type: 'string' }, { type: 'number' }] }, true)).toBe('s|n');
+    });
+
+    it('handles array with items', () => {
+      expect(formatType({ type: 'array', items: { type: 'number' } }, true)).toBe('n[]');
+    });
+
+    it('defaults to string for unknown', () => {
+      expect(formatType({}, true)).toBe('s');
+      expect(formatType({}, false)).toBe('string');
+    });
+  });
+
+  describe('Stage 5: shared param extraction', () => {
+    it('extracts shared params when 3+ tools share them', () => {
+      const tools = [
+        makeTool('srv__list', { owner: { type: 'string' }, repo: { type: 'string' }, page: { type: 'number' } }, { schemaExtra: { required: ['owner', 'repo'] } }),
+        makeTool('srv__get', { owner: { type: 'string' }, repo: { type: 'string' }, id: { type: 'number' } }, { schemaExtra: { required: ['owner', 'repo', 'id'] } }),
+        makeTool('srv__create', { owner: { type: 'string' }, repo: { type: 'string' }, title: { type: 'string' } }, { schemaExtra: { required: ['owner', 'repo', 'title'] } }),
+      ];
+
+      const compressed = compressTools(tools, 'extreme');
+      // First tool should have shared params note
+      expect(compressed[0].description).toContain('[srv shared params:');
+      // Individual tools should have shared params removed from their signatures
+      expect(compressed[1].description).not.toContain('owner');
+      expect(compressed[2].description).not.toContain('owner');
+    });
+
+    it('does not extract when fewer than 3 tools', () => {
+      const tools = [
+        makeTool('t1', { x: { type: 'string' } }),
+        makeTool('t2', { x: { type: 'string' } }),
+      ];
+
+      const compressed = compressTools(tools, 'extreme');
+      expect(compressed[0].description).not.toContain('shared');
     });
   });
 });

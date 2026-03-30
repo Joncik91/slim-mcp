@@ -1,6 +1,6 @@
 {
   "name": "slim-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MCP proxy that gives agents their context window back. Schema compression, lazy loading, response caching.",
   "type": "module",
   "main": "dist/index.js",

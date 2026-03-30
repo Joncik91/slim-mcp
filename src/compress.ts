@@ -1,15 +1,27 @@
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 
-export type CompressionLevel = 'none' | 'standard' | 'aggressive';
+export type CompressionLevel = 'none' | 'standard' | 'aggressive' | 'extreme' | 'maximum';
 
 /**
  * Compress a list of tools according to the specified level.
  * 'none' returns tools unchanged.
- * 'standard' and 'aggressive' apply Stage 1 structural cleanup.
+ * 'standard' and 'aggressive' apply Stage 1-3 structural cleanup.
+ * 'extreme' embeds TS-style signatures in descriptions, strips inputSchema.
+ * 'maximum' uses ultra-short types (s/n/b), ! for required, shared param extraction.
  */
 export function compressTools(tools: Tool[], level: CompressionLevel): Tool[] {
   if (level === 'none') {
     return tools;
+  }
+
+  // extreme/maximum: signature embedding pipeline
+  if (level === 'extreme' || level === 'maximum') {
+    let result = tools.map((tool) => embedSignature(tool, level));
+    // Stage 5: shared param extraction for multi-tool sets
+    if (result.length >= 3) {
+      result = extractSharedParams(result, level);
+    }
+    return result;
   }
 
   const compressed = tools.map((tool) => compressTool(tool, level));
@@ -290,4 +302,187 @@ function shouldStripDescription(propName: string, description: string): boolean 
   }
 
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4: Signature embedding (extreme + maximum)
+// ---------------------------------------------------------------------------
+
+const SHORT_TYPES: Record<string, string> = {
+  string: 's', number: 'n', integer: 'n', boolean: 'b', object: 'obj', array: 'arr', null: 'null',
+};
+
+export function formatType(schema: Record<string, unknown>, short: boolean): string {
+  const type = schema.type as string | undefined;
+
+  // Enum
+  if (Array.isArray(schema.enum)) {
+    const vals = (schema.enum as unknown[]).map(v => JSON.stringify(v)).join('|');
+    return vals;
+  }
+
+  // Array with items
+  if (type === 'array') {
+    const items = schema.items as Record<string, unknown> | undefined;
+    if (items) {
+      const inner = formatType(items, short);
+      return `${inner}[]`;
+    }
+    return short ? 'arr' : 'array';
+  }
+
+  // Nested object with properties
+  if (type === 'object' && schema.properties && typeof schema.properties === 'object') {
+    const props = schema.properties as Record<string, Record<string, unknown>>;
+    const innerReq = new Set(Array.isArray(schema.required) ? schema.required as string[] : []);
+    const parts = Object.entries(props).map(([name, prop]) => {
+      const t = formatType(prop, short);
+      const req = innerReq.has(name) ? (short ? '!' : '') : '?';
+      return short ? `${name}:${t}${req}` : `${name}: ${t}${req}`;
+    });
+    return `{${parts.join(short ? ' ' : ', ')}}`;
+  }
+
+  // Simple type
+  if (type) {
+    if (schema.nullable === true) {
+      const base = short ? (SHORT_TYPES[type] || type) : type;
+      return `${base}|null`;
+    }
+    return short ? (SHORT_TYPES[type] || type) : type;
+  }
+
+  // anyOf/oneOf
+  for (const kw of ['anyOf', 'oneOf'] as const) {
+    if (Array.isArray(schema[kw])) {
+      const variants = (schema[kw] as Record<string, unknown>[])
+        .map(v => formatType(v, short))
+        .filter(Boolean);
+      return variants.join('|');
+    }
+  }
+
+  return short ? 's' : 'string';
+}
+
+export function embedSignature(tool: Tool, level: 'extreme' | 'maximum'): Tool {
+  const short = level === 'maximum';
+  const schema = (tool as any).inputSchema;
+  const props = schema?.properties as Record<string, Record<string, unknown>> | undefined;
+
+  if (!props || Object.keys(props).length === 0) {
+    const desc = tool.description || tool.name;
+    return {
+      name: tool.name,
+      description: short ? truncateDesc(desc, 80) : truncateDesc(desc, 150),
+      inputSchema: { type: 'object' as const },
+    };
+  }
+
+  const required = new Set(Array.isArray(schema.required) ? schema.required as string[] : []);
+
+  const params = Object.entries(props).map(([name, prop]) => {
+    const type = formatType(prop, short);
+    if (short) {
+      const req = required.has(name) ? '!' : '';
+      return `${name}:${type}${req}`;
+    } else {
+      const req = required.has(name) ? ' (required)' : '';
+      return `${name}: ${type}${req}`;
+    }
+  });
+
+  const prefix = short ? 'P:' : 'Params:';
+  const sep = short ? ' ' : ', ';
+  const paramStr = `${prefix} ${params.join(sep)}`;
+
+  const baseDesc = tool.description || tool.name;
+  const trimmedDesc = short ? truncateDesc(baseDesc, 60) : truncateDesc(baseDesc, 120);
+  const description = `${trimmedDesc}. ${paramStr}`;
+
+  return {
+    name: tool.name,
+    description,
+    inputSchema: { type: 'object' as const },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Stage 5: Shared parameter extraction (extreme + maximum, 3+ tools)
+// ---------------------------------------------------------------------------
+
+export function extractSharedParams(tools: Tool[], level: 'extreme' | 'maximum'): Tool[] {
+  const short = level === 'maximum';
+  const prefix = short ? 'P:' : 'Params:';
+
+  // Group tools by server namespace
+  const groups = new Map<string, { indices: number[]; paramCounts: Map<string, number> }>();
+
+  for (let i = 0; i < tools.length; i++) {
+    const name = tools[i].name;
+    const sep = name.indexOf('__');
+    const server = sep > 0 ? name.slice(0, sep) : '_default';
+
+    if (!groups.has(server)) {
+      groups.set(server, { indices: [], paramCounts: new Map() });
+    }
+    const group = groups.get(server)!;
+    group.indices.push(i);
+
+    // Extract params from the signature in the description
+    const desc = tools[i].description || '';
+    const prefixEscaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const paramMatch = desc.match(new RegExp(`${prefixEscaped}\\s*(.+)$`));
+    if (paramMatch) {
+      const paramSection = paramMatch[1];
+      const paramList = short
+        ? paramSection.split(/\s+/).filter(Boolean)
+        : paramSection.split(/,\s*/).filter(Boolean);
+      for (const p of paramList) {
+        group.paramCounts.set(p, (group.paramCounts.get(p) || 0) + 1);
+      }
+    }
+  }
+
+  const result = [...tools];
+  for (const [server, group] of groups) {
+    if (group.indices.length < 3) continue;
+
+    const threshold = Math.min(3, Math.ceil(group.indices.length * 0.6));
+    const sharedParams: string[] = [];
+    for (const [param, count] of group.paramCounts) {
+      if (count >= threshold) {
+        sharedParams.push(param);
+      }
+    }
+    if (sharedParams.length === 0) continue;
+
+    // Prepend shared note to first tool in group
+    const sharedNote = short
+      ? `[${server} shared: ${sharedParams.join(' ')}]`
+      : `[${server} shared params: ${sharedParams.join(', ')}]`;
+
+    const firstIdx = group.indices[0];
+    result[firstIdx] = {
+      ...result[firstIdx],
+      description: `${sharedNote} ${result[firstIdx].description || ''}`,
+    };
+
+    // Remove shared params from each tool's signature
+    for (const idx of group.indices) {
+      let desc = result[idx].description || '';
+      for (const sp of sharedParams) {
+        const escaped = sp.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        // Remove with surrounding separators
+        desc = desc.replace(new RegExp(`,?\\s*${escaped}`), '');
+        desc = desc.replace(new RegExp(`${escaped},?\\s*`), '');
+      }
+      // Clean up empty param sections
+      desc = desc.replace(/Params:\s*$/g, '').replace(/P:\s*$/g, '');
+      desc = desc.replace(/\.\s*$/g, '.').trim();
+      result[idx] = { ...result[idx], description: desc };
+    }
+  }
+
+  return result;
 }
