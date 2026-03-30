@@ -7,3 +7,4 @@ scripts/smoke-test-real.json
 scripts/smoke-test-*.local.json
 *.bak
 docs/superpowers/
+docs/research/
