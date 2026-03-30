@@ -25,12 +25,19 @@ export interface CacheConfig {
   never_cache?: string[];
 }
 
+export interface DashboardConfig {
+  enabled?: boolean;
+  port?: number;
+  host?: string;
+}
+
 export interface McpSlimConfig {
   servers: Record<string, ServerConfig>;
   compression: 'none' | 'standard' | 'aggressive';
   cache?: CacheConfig;
   max_tools_loaded?: number;
   lazy_loading?: boolean;
+  dashboard?: DashboardConfig;
 }
 
 export function expandEnvVars(env: Record<string, string>): Record<string, string> {
@@ -196,6 +203,16 @@ function parseConfig(raw: unknown, sourcePath: string): McpSlimConfig {
 
   if (typeof obj.lazy_loading === 'boolean') {
     config.lazy_loading = obj.lazy_loading;
+  }
+
+  // Parse dashboard config
+  if (typeof obj.dashboard === 'object' && obj.dashboard !== null && !Array.isArray(obj.dashboard)) {
+    const d = obj.dashboard as Record<string, unknown>;
+    config.dashboard = {
+      enabled: d.enabled !== false,
+      port: typeof d.port === 'number' ? d.port : 7333,
+      host: typeof d.host === 'string' ? d.host : '0.0.0.0',
+    };
   }
 
   return config;

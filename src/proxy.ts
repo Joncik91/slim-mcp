@@ -19,6 +19,7 @@ import { createLazyToolManager, formatLazyReport } from './lazy.js';
 import type { LazyToolManager } from './lazy.js';
 import type { CacheConfig } from './config.js';
 import type { McpSlimConfig } from './config.js';
+import { stats } from './stats.js';
 
 // ---------------------------------------------------------------------------
 // Option types
@@ -341,6 +342,18 @@ async function startMultiServerProxy(options: MultiServerOptions): Promise<void>
   const connectedCount = [...serverManager.servers.values()].filter((s) => s.connected).length;
   const useNamespace = connectedCount >= 2;
 
+  // Register servers with stats
+  for (const [name, srv] of serverManager.servers) {
+    const cfg = config.servers[name];
+    const transport = cfg?.url ? (cfg.type ?? 'http') : 'stdio';
+    stats.registerServer({
+      name,
+      transport,
+      tools: srv.tools.length,
+      status: srv.connected ? 'connected' : 'failed',
+    });
+  }
+
   // Lazy loading setup
   const lazyDisabled = options.noLazy === true || config.lazy_loading === false;
   const maxTools = options.maxTools ?? config.max_tools_loaded ?? 8;
@@ -364,6 +377,7 @@ async function startMultiServerProxy(options: MultiServerOptions): Promise<void>
     ? createLazyToolManager({ maxToolsLoaded: maxTools, alwaysLoad: allAlwaysLoad })
     : null;
 
+  stats.recordCacheEnabled(!!cache);
   if (cache) info(`Cache: enabled (default TTL ${cacheConfig.default_ttl}s)`);
   else info(`Cache: disabled`);
   info(`Lazy loading: ${lazyManager ? `enabled (max ${maxTools} full)` : `disabled${totalTools <= 15 && !lazyExplicit ? ` (${totalTools} tools ≤ 15)` : ''}` }`);
@@ -385,6 +399,7 @@ async function startMultiServerProxy(options: MultiServerOptions): Promise<void>
       const report = lazyManager.getReport();
       if (report) {
         info(formatLazyReport(report));
+        stats.recordLazy(true, report.stats.loaded, report.stats.slim, report.withoutLazyTokens - report.slimTokens - report.fullTokens, report.withoutLazyTokens);
       }
     }
 
@@ -405,6 +420,7 @@ async function startMultiServerProxy(options: MultiServerOptions): Promise<void>
     const after = estimateTokens(compressed);
 
     info(formatCompressionReport({ toolCount: compressed.length, beforeTokens: before, afterTokens: after }));
+    stats.recordCompression(level, before, after);
 
     for (let i = 0; i < tools.length; i++) {
       const origTokens = estimateTokens(tools[i]);
@@ -423,11 +439,16 @@ async function startMultiServerProxy(options: MultiServerOptions): Promise<void>
     const args = (request.params.arguments ?? {}) as Record<string, unknown>;
     debug(`tools/call: ${toolName}`);
 
+    const callStart = Date.now();
+
     // Lazy loading: intercept slim tools BEFORE cache check
     if (lazyManager && lazyManager.isSlim(toolName)) {
       lazyManager.promoteTools([toolName]);
-      const stats = lazyManager.getStats();
-      info(`Promoted tool: ${toolName} (${stats.loaded + 1} full + ${stats.slim - 1} slim)`);
+      const lazyStats = lazyManager.getStats();
+      info(`Promoted tool: ${toolName} (${lazyStats.loaded + 1} full + ${lazyStats.slim - 1} slim)`);
+      stats.recordPromotion(toolName);
+      const serverName = useNamespace ? (parseNamespacedToolName(toolName).serverName || '_unknown') : '_single';
+      stats.recordToolCall({ tool: toolName, server: serverName, cached: false, promoted: true, timestamp: new Date().toISOString(), durationMs: Date.now() - callStart });
       return {
         content: [{ type: 'text', text: 'Tool schema was not fully loaded. It has been loaded now. Please retry your call.' }],
         isError: true,
@@ -452,11 +473,14 @@ async function startMultiServerProxy(options: MultiServerOptions): Promise<void>
         cache.recordSkip();
         debug(`Cache skip: ${toolName} (matches never-cache pattern)`);
         cache.invalidateServer(serverName);
+        stats.recordCacheInvalidation(serverName);
       } else {
         const cached = cache.get(serverName, originalToolName, args);
         if (cached) {
           const age = Math.round((Date.now() - cached.cachedAt) / 1000);
           info(`Cache hit: ${toolName} (cached ${age}s ago)`);
+          stats.recordToolCall({ tool: toolName, server: serverName, cached: true, promoted: false, timestamp: new Date().toISOString(), durationMs: Date.now() - callStart });
+          if (cache) stats.updateCacheStats(cache.getStats(), cache.size);
           return cached.result as { content: unknown[] };
         }
       }
@@ -464,6 +488,7 @@ async function startMultiServerProxy(options: MultiServerOptions): Promise<void>
 
     try {
       const result = await serverManager.routeToolCall(toolName, args, useNamespace);
+      const durationMs = Date.now() - callStart;
       // Cache successful results
       if (cache && cache.shouldCache(originalToolName)) {
         const r = result as any;
@@ -472,9 +497,12 @@ async function startMultiServerProxy(options: MultiServerOptions): Promise<void>
           debug(`Cache miss: ${toolName} → caching`);
         }
       }
+      stats.recordToolCall({ tool: toolName, server: serverName, cached: false, promoted: false, timestamp: new Date().toISOString(), durationMs });
+      if (cache) stats.updateCacheStats(cache.getStats(), cache.size);
       return result as { content: unknown[] };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      stats.recordToolCall({ tool: toolName, server: serverName, cached: false, promoted: false, timestamp: new Date().toISOString(), durationMs: Date.now() - callStart });
       return {
         content: [{ type: 'text', text: `Error: ${msg}` }],
         isError: true,

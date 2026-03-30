@@ -6,11 +6,12 @@ import { writeFileSync, mkdirSync } from 'node:fs';
 const INDEX_PATH = path.resolve(import.meta.dirname, '../../dist/index.js');
 const TMP_DIR = path.resolve(import.meta.dirname, '../../.tmp-e2e');
 
-function runMcpSlim(args: string[]): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
+function runMcpSlim(args: string[], env?: Record<string, string>): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [INDEX_PATH, ...args], {
       stdio: ['pipe', 'pipe', 'pipe'],
       timeout: 10000,
+      env: { ...process.env, ...env },
     });
 
     let stdout = '';
@@ -35,8 +36,8 @@ describe('error handling', () => {
   });
 
   it('no args and no config exits with usage', async () => {
-    // Run from a directory without .slim-mcp.json
-    const { exitCode, stderr } = await runMcpSlim([]);
+    // Run with HOME set to temp dir so no ~/.slim-mcp.json is discovered
+    const { exitCode, stderr } = await runMcpSlim([], { HOME: TMP_DIR });
     expect(exitCode).toBe(1);
     expect(stderr).toContain('Usage');
   });

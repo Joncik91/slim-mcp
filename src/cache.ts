@@ -161,6 +161,10 @@ export class ResponseCache {
     this.stats.skips++;
   }
 
+  get size(): number {
+    return this.cache.size;
+  }
+
   getStats(): CacheStats {
     return { ...this.stats };
   }

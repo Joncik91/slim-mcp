@@ -3,6 +3,7 @@
 import { startProxy } from './proxy.js';
 import { loadConfig } from './config.js';
 import { setVerbose, info, error } from './logger.js';
+import { startDashboard } from './dashboard.js';
 import type { CompressionLevel } from './compress.js';
 import type { TransportType } from './transport/http.js';
 
@@ -23,6 +24,8 @@ interface ParsedArgs {
   command: string | undefined;
   args: string[];
   doubleDash: boolean;
+  dashboardPort: number | undefined;
+  noDashboard: boolean;
 }
 
 function parseArgs(argv: string[]): ParsedArgs | null {
@@ -38,6 +41,8 @@ function parseArgs(argv: string[]): ParsedArgs | null {
   let headers: Record<string, string> = {};
   let transport: TransportType | undefined;
   let doubleDash = false;
+  let dashboardPort: number | undefined;
+  let noDashboard = false;
 
   const filtered: string[] = [];
   for (let i = 0; i < args.length; i++) {
@@ -48,6 +53,16 @@ function parseArgs(argv: string[]): ParsedArgs | null {
       noCache = true;
     } else if (arg === '--no-lazy') {
       noLazy = true;
+    } else if (arg === '--no-dashboard') {
+      noDashboard = true;
+    } else if (arg === '--dashboard-port') {
+      const val = args[++i];
+      const num = Number(val);
+      if (!val || !Number.isInteger(num) || num <= 0) {
+        process.stderr.write(`Invalid --dashboard-port value: ${val ?? '(missing)'}. Must be a positive integer.\n`);
+        return null;
+      }
+      dashboardPort = num;
     } else if (arg === '--max-tools') {
       const val = args[++i];
       const num = Number(val);
@@ -98,7 +113,7 @@ function parseArgs(argv: string[]): ParsedArgs | null {
       doubleDash = true;
       const rest = args.slice(i + 1);
       if (rest.length === 0) return null;
-      return { command: rest[0], args: rest.slice(1), verbose, compression, compressionExplicit, noCache, noLazy, maxTools, configPath, url, headers, transport, doubleDash };
+      return { command: rest[0], args: rest.slice(1), verbose, compression, compressionExplicit, noCache, noLazy, maxTools, configPath, url, headers, transport, doubleDash, dashboardPort, noDashboard };
     } else {
       filtered.push(arg);
     }
@@ -106,7 +121,7 @@ function parseArgs(argv: string[]): ParsedArgs | null {
 
   const command = filtered.length > 0 ? filtered[0] : undefined;
   const commandArgs = filtered.slice(1);
-  return { command, args: commandArgs, verbose, compression, compressionExplicit, noCache, noLazy, maxTools, configPath, url, headers, transport, doubleDash };
+  return { command, args: commandArgs, verbose, compression, compressionExplicit, noCache, noLazy, maxTools, configPath, url, headers, transport, doubleDash, dashboardPort, noDashboard };
 }
 
 function printUsage(): void {
@@ -127,6 +142,8 @@ Options:
   --url <url>            Connect to a remote MCP server
   --header <key:value>   Add HTTP header (repeatable)
   --transport <type>     http | sse (default: auto-detect)
+  --dashboard-port <n>   Enable dashboard on port (default: 7333)
+  --no-dashboard         Disable dashboard
   -v, --verbose          Show detailed logging
   --version              Show version
   --help                 Show this help
@@ -165,6 +182,18 @@ async function main(): Promise<void> {
   setVerbose(parsed.verbose);
   info(`slim-mcp v0.1.0`);
 
+  // Dashboard helper: resolve config from CLI flags + config file
+  const startDashboardIfEnabled = (isMultiServer: boolean, configDashboard?: { enabled?: boolean; port?: number; host?: string }) => {
+    if (parsed.noDashboard) return;
+    // Dashboard defaults to enabled in multi-server mode
+    const port = parsed.dashboardPort ?? configDashboard?.port ?? 7333;
+    const host = configDashboard?.host ?? '0.0.0.0';
+    const enabled = parsed.dashboardPort !== undefined || configDashboard?.enabled === true || (isMultiServer && configDashboard?.enabled !== false);
+    if (enabled) {
+      startDashboard({ enabled: true, port, host });
+    }
+  };
+
   try {
     // Mode 0: --url → single remote server via multi-server config
     if (parsed.url) {
@@ -181,6 +210,7 @@ async function main(): Promise<void> {
         servers: { remote: serverConfig },
         compression: parsed.compression,
       } as any;
+      startDashboardIfEnabled(true);
       await startProxy({ mode: 'multi', config, noCache: parsed.noCache, noLazy: parsed.noLazy, maxTools: parsed.maxTools });
       return;
     }
@@ -206,6 +236,7 @@ async function main(): Promise<void> {
         if (parsed.compressionExplicit) {
           config.compression = parsed.compression;
         }
+        startDashboardIfEnabled(true, config.dashboard);
         await startProxy({ mode: 'multi', config, noCache: parsed.noCache, noLazy: parsed.noLazy, maxTools: parsed.maxTools });
         return;
       }
