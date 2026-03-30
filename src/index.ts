@@ -136,7 +136,7 @@ Examples:
   npx slim-mcp --url https://mcp.example.com/mcp
   npx slim-mcp --compression aggressive --config ~/.slim-mcp.json
 
-Documentation: https://github.com/Joncik91/mcp-slim
+Documentation: https://github.com/Joncik91/slim-mcp
 `);
 }
 

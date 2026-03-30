@@ -1,6 +1,6 @@
 {
   "name": "slim-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "MCP proxy that gives agents their context window back. Schema compression, lazy loading, response caching.",
   "type": "module",
   "main": "dist/index.js",
@@ -40,9 +40,9 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/Joncik91/mcp-slim"
+    "url": "https://github.com/Joncik91/slim-mcp"
   },
-  "homepage": "https://github.com/Joncik91/mcp-slim",
+  "homepage": "https://github.com/Joncik91/slim-mcp",
   "engines": {
     "node": ">=18"
   },
