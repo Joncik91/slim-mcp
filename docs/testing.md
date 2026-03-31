@@ -142,16 +142,18 @@ The smoke test never modifies `~/.claude.json` (the manual setup script does, bu
 ### Test Suite Overview
 
 ```
-203 tests total
-├── 173 unit tests    (10 files, ~65s)
+220+ tests total
+├── 190 unit tests    (10 files, ~65s)
 ├──  30 e2e tests     (5 files, ~110s)
-└──   2 smoke tests   (single-server + multi-server)
+├──   2 smoke tests   (single-server + multi-server)
+└── 120 accuracy tests (8 scenarios × 5 levels × 3 runs, via Anthropic API)
 ```
 
 ```bash
 npm test              # Unit tests
 npm run test:e2e      # E2E tests (sequential, spawns processes)
 npm run smoke-test    # Smoke test with real servers
+ANTHROPIC_API_KEY=... npx tsx scripts/accuracy-test.ts  # Accuracy test
 ```
 
 ### Unit Tests
@@ -166,7 +168,7 @@ npx vitest run test/compress.test.ts  # Single file
 
 | File | Module | What it covers |
 |------|--------|----------------|
-| `compress.test.ts` | Schema compression | Structural cleanup, description trimming, parameter dedup |
+| `compress.test.ts` | Schema compression | Structural cleanup, description trimming, parameter dedup, extreme/maximum signature embedding |
 | `config.test.ts` | Config parsing | JSON parsing, server validation, env var expansion |
 | `config-http.test.ts` | HTTP/SSE config | URL/command XOR, type/headers validation |
 | `cache.test.ts` | Response caching | TTL, LRU eviction, write invalidation, stats |
@@ -221,6 +223,37 @@ The test asserts on both MCP protocol responses and stderr log output.
 - `stopHarness(harness)` -- closes client, waits for exit (timeout + SIGKILL fallback)
 - `findStderr(harness, pattern)` -- searches stderr for a string or regex
 - `waitForStderr(harness, pattern, timeout?)` -- polls for a stderr match
+
+### Accuracy Tests
+
+Validates that compressed tool schemas produce correct tool calls via the Anthropic API. This is not a unit test -- it makes real API calls and costs ~$0.20 per run.
+
+```bash
+ANTHROPIC_API_KEY=sk-... npx tsx scripts/accuracy-test.ts
+ANTHROPIC_API_KEY=sk-... npx tsx scripts/accuracy-test.ts --runs 1  # Quick single run
+```
+
+**Methodology:**
+- Model: Claude Sonnet 4
+- 8 test scenarios per compression level (bridge_get_summary, fs_read, fs_list, fs_search, fs_info, fs_tree, bridge_read_spec, bridge_read_decisions)
+- 3 runs per scenario for reliability
+- 5 compression levels: none, standard, aggressive, extreme, maximum
+- Total: 120 API calls per full run
+
+**What it validates:**
+- Tool selection: did the LLM pick the correct tool name?
+- Argument presence: are all required arguments included?
+- Argument types: are strings sent as strings, numbers as numbers?
+
+**Results (March 2026):**
+
+| Level | Accuracy | Token Reduction |
+|-------|----------|-----------------|
+| none | 100% | baseline |
+| standard | 100% | 19% |
+| aggressive | 100% | 35% |
+| extreme | 100% | 72% |
+| maximum | 100% | 77% |
 
 ### Smoke Tests
 
