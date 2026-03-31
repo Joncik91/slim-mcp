@@ -8,3 +8,4 @@ scripts/smoke-test-*.local.json
 *.bak
 docs/superpowers/
 docs/research/
+CLAUDE.md
