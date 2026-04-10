@@ -53,7 +53,7 @@ The config file is a JSON file with the following shape:
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `servers` | `Record<string, ServerConfig>` | Yes | -- | Map of server names to their configurations. Must contain at least one entry. |
-| `compression` | `"none" \| "standard" \| "aggressive"` | No | `"standard"` | Controls how aggressively tool schemas are compressed before being sent to the LLM. |
+| `compression` | `"none" \| "standard" \| "aggressive" \| "extreme" \| "maximum"` | No | `"standard"` | Controls how aggressively tool schemas are compressed before being sent to the LLM. |
 | `lazy_loading` | `boolean` | No | Auto | Whether to use lazy loading for tool schemas. When omitted, defaults to `true` if the total number of tools across all servers exceeds 15, `false` otherwise. |
 | `max_tools_loaded` | `number` | No | `8` | Maximum number of tools that receive full (uncompressed) schemas at any time. Only relevant when lazy loading is enabled. |
 | `cache` | `CacheConfig` | No | See [Cache Configuration](#cache-configuration) | Response caching settings. A default config is auto-created if any server specifies `cache_ttl`. |
@@ -62,13 +62,27 @@ The config file is a JSON file with the following shape:
 
 - **`none`** -- Tool schemas are passed through unmodified.
 - **`standard`** -- Descriptions are shortened, optional fields with defaults are omitted, and parameter descriptions are trimmed. Good balance between token savings and clarity.
-- **`aggressive`** -- On top of standard compression, examples are removed, enum descriptions are collapsed, and schemas are minimized to the bare structural minimum. Use when token budget is extremely tight.
+- **`aggressive`** -- On top of standard compression, examples are removed, enum descriptions are collapsed, and schemas are minimized to the bare structural minimum. Use when token budget is tight.
+- **`extreme`** -- Instead of full JSON Schema, embeds TypeScript-style parameter signatures in the tool description and strips the `inputSchema`. The LLM reads the description to understand parameters. Benchmark: 72% token reduction vs `none`, 100% accuracy in validation runs.
+- **`maximum`** -- Same signature-in-description approach as `extreme`, but with ultra-short type abbreviations (`s`/`n`/`b` for string/number/boolean) and `!` suffixes to mark required parameters. Benchmark: 77% token reduction vs `none`, 100% accuracy. Use when every token counts.
 
 #### Lazy loading behavior
 
 When lazy loading is active, only `max_tools_loaded` tools receive their full schemas at a time. The remaining tools are presented as stubs (name + one-line description). When the LLM requests a lazily-loaded tool, its full schema is swapped in and the least-recently-used full schema is demoted back to a stub.
 
 Tools listed in a server's `always_load` array are exempt from demotion and always retain their full schemas. These tools count toward the `max_tools_loaded` limit.
+
+#### When to use `always_load`
+
+Lazy loading is a win on token budget but it has a behavioral cost: **deferred tools are less visible to the LLM**. When a tool's schema is swapped out to a stub, the LLM sees only its name + one-line description. In practice, LLMs default to the tools whose full schemas they can see -- meaning a deferred tool can remain effectively unused even when it's the right tool for the task.
+
+Use `always_load` for your **3-5 most-used tools per server**. Typical patterns:
+
+- A filesystem server where `read_file` and a content-search tool are the workhorses -- pin both so they compete with the host agent's native `Grep`/`Read` tools.
+- A database server where `query` is used constantly while `schema_introspect` is rare -- pin `query` only.
+- A CI/deploy server with a `trigger_build` tool that the LLM needs to reflexively reach for during release work -- pin it so it never demotes.
+
+Rule of thumb: if you've observed the LLM reaching for a generic/native alternative when a better MCP tool exists, that MCP tool is a good `always_load` candidate. The structural fix (promoting the tool) is more robust than a prompt-level reminder ("remember to use tool X"), which drifts in long sessions.
 
 ---
 
