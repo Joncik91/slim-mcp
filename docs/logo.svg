@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" role="img" aria-label="slim-mcp">
+  <title>slim-mcp</title>
+
+  <!--
+    slim-mcp — an MCP proxy that compresses 57 tools' schemas from
+    7,528 tokens to 1,750 (77% reduction) at 100% accuracy.
+
+    The mark is the programmer-vocabulary version of compression:
+    a bracket pair [ ] containing three ellipsis dots [...] — the
+    schema's contents collapsed to its essence.
+
+    Asymmetry encodes the direction of compression: the left
+    bracket is full-height (the input schema), the right bracket
+    is shorter (the output, slimmed). No arrows, no flow-icon
+    cliché — the bracket-height differential does the work.
+
+    Substrate: same dark panel + amber accent as the rest of the
+    portfolio. rx=48 corners.
+  -->
+
+  <rect width="400" height="400" rx="48" fill="#0E0E0F"/>
+
+  <!--
+    Left bracket — the wide input. Full height: 200 units, from
+    y=100 to y=300. Built as one stroked path so the corners are
+    real mitre joins, not endpoint stacks.
+
+    Stroke 28 (7%) keeps the bracket emphatic at favicon size.
+    Square caps + miter joins for the brutalist tone.
+
+    The bracket arms project 36 units inward from the vertical
+    spine — a deliberate, square hook (not a curve, not a serif).
+  -->
+  <g fill="none" stroke="#E8954A" stroke-width="28"
+     stroke-linecap="square" stroke-linejoin="miter">
+
+    <!-- Left bracket [ at x=88, full height -->
+    <path d="M 124 100 L 88 100 L 88 300 L 124 300"/>
+
+    <!-- Right bracket ] at x=312, shorter (140 units, y=130 to y=270).
+         The 30-unit reduction at the top + 30-unit reduction at the
+         bottom is the visible compression — left bracket spans 200
+         units of height, right bracket spans 140. -->
+    <path d="M 276 130 L 312 130 L 312 270 L 276 270"/>
+  </g>
+
+  <!--
+    Three ellipsis dots [...] floating in the bracket interior.
+    Small, equal-sized, evenly spaced along the horizontal axis.
+    This is the compressed content — what the brackets contain.
+
+    Square dots (not circles) keep the typographic / monospace
+    feel. A circular dot would read as "bullet"; a square dot
+    reads as "block of compressed data."
+
+    Dots are 22×22 squares, centred on y=200 (the canvas centre).
+    x-positions: 168, 200, 232 — 32 units apart, symmetric around
+    centre. Each square is 22 wide, so visible gap between them
+    is 10 units — tight, ellipsis-like.
+  -->
+  <g fill="#E8954A">
+    <rect x="157" y="189" width="22" height="22"/>
+    <rect x="189" y="189" width="22" height="22"/>
+    <rect x="221" y="189" width="22" height="22"/>
+  </g>
+</svg>

@@ -1,6 +1,37 @@
+<div align="center">
+
+<img src="docs/logo.svg" alt="slim-mcp" width="160" height="160">
+
 # slim-mcp
 
-MCP proxy that compresses tool schemas, lazy-loads definitions, caches responses, and aggregates multiple servers -- giving AI agents their context window back.
+[![npm](https://img.shields.io/npm/v/slim-mcp?color=E8954A&logo=npm)](https://www.npmjs.com/package/slim-mcp)
+[![Node.js 18+](https://img.shields.io/badge/node-18%2B-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-E8954A.svg)](LICENSE)
+[![tests: 220](https://img.shields.io/badge/tests-220%20%C2%B7%20190%20unit%20%2B%2030%20e2e-E8954A)]()
+[![accuracy: 100%](https://img.shields.io/badge/accuracy-100%25%20%C2%B7%20120%20API%20calls-E8954A)]()
+[![reduction: 77%](https://img.shields.io/badge/token%20reduction-up%20to%2077%25-E8954A)]()
+
+***MCP proxy that gives agents their context window back.***
+
+Compresses tool schemas (5 levels, up to 77% reduction), lazy-loads tool definitions, caches read-only responses, and aggregates multiple MCP servers behind one stdio interface. Validated against Claude Sonnet 4 across 120 API calls — 100% accuracy at every compression level.
+
+</div>
+
+## Table of Contents
+
+- [Benchmarks](#benchmarks)
+- [Install](#install)
+- [Quick Start](#quick-start)
+- [Agent Integration](#agent-integration)
+- [Features](#features)
+- [Configuration](#configuration)
+- [CLI](#cli)
+- [How It Works](#how-it-works)
+- [Testing](#testing)
+- [Security](#security)
+- [Requirements](#requirements)
+- [License](#license)
 
 ## Benchmarks
 
@@ -235,10 +266,42 @@ ANTHROPIC_API_KEY=sk-... npx tsx scripts/accuracy-test.ts
 
 Details in [docs/testing.md](docs/testing.md).
 
+## Security
+
+slim-mcp is a **proxy in the middle of your agent and your MCP servers**.
+That position has implications worth being explicit about.
+
+- **Tokens flow through.** Configs accept `${VAR}` env-var expansion for
+  headers (e.g. `"Authorization": "Bearer ${API_TOKEN}"`). The proxy
+  forwards those headers verbatim to the wrapped server. Tokens are
+  **not logged** (verbose mode prints JSON-RPC frames, not headers),
+  but the same operational hygiene applies as to any reverse proxy:
+  keep `.slim-mcp.json` out of git, use environment variables for
+  secrets, and don't run the proxy on a host that holds tokens you
+  wouldn't put on that host directly.
+- **Tool calls are forwarded.** Compression rewrites the schema the
+  agent sees; it does not rewrite the call the agent makes. Any
+  destructive tool the wrapped server exposes is still destructive.
+  Audit your wrapped servers as you would unwrapped.
+- **Cache hits return prior responses.** Read-only calls are cached
+  with a TTL + LRU. The cache invalidates on writes (`tools/call`
+  for any non-read tool clears matching entries), but the threat
+  model is single-tenant: don't expose one cache to multiple
+  unrelated agents or trust-boundaries.
+- **Dashboard is loopback by default.** When enabled, the dashboard
+  binds `127.0.0.1:7333` and serves recent tool calls + stats. Don't
+  change the bind address without a reverse proxy and auth in front
+  — recent tool calls are sensitive.
+
+For production-style use: lock the config file's permissions to your
+user, run the proxy as the same user as the agent, and treat
+`tools/list` and `tools/call` traffic as you would the underlying
+servers' traffic.
+
 ## Requirements
 
 - Node.js >= 18
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
