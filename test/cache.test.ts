@@ -149,8 +149,8 @@ describe('get / set', () => {
   });
 
   it('entry includes correct result, ttl, and hits count', () => {
-    cache.set('srv', 'read_file', { path: '/a' }, 'data');
-    const entry = cache.get('srv', 'read_file', { path: '/a' });
+    cache.set('srv', 'lookup_thing', { path: '/a' }, 'data');
+    const entry = cache.get('srv', 'lookup_thing', { path: '/a' });
     expect(entry).not.toBeNull();
     expect(entry!.result).toBe('data');
     expect(entry!.ttl).toBe(300);
@@ -181,21 +181,21 @@ describe('TTL expiry', () => {
 
   it('returns null after TTL expires', () => {
     const cache = new ResponseCache(makeConfig({ default_ttl: 10 }));
-    cache.set('srv', 'read_file', { path: '/a' }, 'data');
+    cache.set('srv', 'lookup_thing', { path: '/a' }, 'data');
 
     // Advance past TTL (10s = 10000ms)
     vi.advanceTimersByTime(10_001);
 
-    expect(cache.get('srv', 'read_file', { path: '/a' })).toBeNull();
+    expect(cache.get('srv', 'lookup_thing', { path: '/a' })).toBeNull();
   });
 
   it('returns entry before TTL expires', () => {
     const cache = new ResponseCache(makeConfig({ default_ttl: 10 }));
-    cache.set('srv', 'read_file', { path: '/a' }, 'data');
+    cache.set('srv', 'lookup_thing', { path: '/a' }, 'data');
 
     vi.advanceTimersByTime(9_999);
 
-    expect(cache.get('srv', 'read_file', { path: '/a' })).not.toBeNull();
+    expect(cache.get('srv', 'lookup_thing', { path: '/a' })).not.toBeNull();
   });
 });
 
@@ -241,8 +241,8 @@ describe('TTL resolution order', () => {
       server_ttls: { other: 200 },
       tool_ttls: { other_tool: 300 },
     }));
-    cache.set('myserver', 'read_file', {}, 'data');
-    const entry = cache.get('myserver', 'read_file', {});
+    cache.set('myserver', 'custom_lookup', {}, 'data');
+    const entry = cache.get('myserver', 'custom_lookup', {});
     expect(entry!.ttl).toBe(42);
   });
 
@@ -405,5 +405,108 @@ describe('disabled cache', () => {
     // A more meaningful test: with enabled=false, external code should skip caching.
     expect(cache.get('srv', 'read_file', {})).not.toBeNull();
     // This confirms the enabled flag must be checked externally, not by the class.
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Hardening (regressions for audited bugs)
+// ---------------------------------------------------------------------------
+
+describe('built-in TTLs', () => {
+  it('apply when no tool_ttls/server_ttls match', () => {
+    const cache = new ResponseCache(makeConfig({ default_ttl: 300 }));
+    cache.set('srv', 'git_status', {}, 'x');
+    expect(cache.get('srv', 'git_status', {})!.ttl).toBe(15);
+  });
+
+  it('lose to server_ttls', () => {
+    const cache = new ResponseCache(makeConfig({ server_ttls: { srv: 5 } }));
+    cache.set('srv', 'git_status', {}, 'x');
+    expect(cache.get('srv', 'git_status', {})!.ttl).toBe(5);
+  });
+});
+
+describe('token-based classification', () => {
+  const cache = new ResponseCache(makeConfig());
+
+  it('does not treat verb-prefixed nouns as writes', () => {
+    for (const tool of ['calculate_total', 'postgres_schema', 'settings_list', 'runtime_info', 'address_lookup']) {
+      expect(cache.shouldCache(tool), tool).toBe(true);
+    }
+  });
+
+  it('catches mutating verbs anywhere in the name', () => {
+    for (const tool of ['issue_create', 'file_write', 'git_commit', 'createIssue', 'browser-click', 'db.insert_row']) {
+      expect(cache.shouldCache(tool), tool).toBe(false);
+    }
+  });
+
+  it('a leading read verb wins over a later mutating noun', () => {
+    expect(cache.shouldCache('get_commit')).toBe(true);
+    expect(cache.shouldCache('list_branch')).toBe(true);
+  });
+
+  it('MCP annotations override the name heuristic', () => {
+    expect(cache.shouldCache('run_report', { readOnlyHint: true })).toBe(true);
+    expect(cache.shouldCache('get_token', { readOnlyHint: false })).toBe(false);
+    expect(cache.shouldCache('get_token', { destructiveHint: true })).toBe(false);
+  });
+
+  it('user never_cache still beats a readOnly annotation', () => {
+    const c = new ResponseCache(makeConfig({ never_cache: ['^get_random'] }));
+    expect(c.shouldCache('get_random_number', { readOnlyHint: true })).toBe(false);
+  });
+});
+
+describe('write/read race', () => {
+  it('drops a read result whose server was invalidated while it was in flight', () => {
+    const cache = new ResponseCache(makeConfig());
+    const gen = cache.generation('srv');
+    cache.invalidateServer('srv'); // a write landed meanwhile
+    expect(cache.set('srv', 'read_file', { p: 1 }, 'stale', gen)).toBe(false);
+    expect(cache.get('srv', 'read_file', { p: 1 })).toBeNull();
+  });
+
+  it('stores when no write happened', () => {
+    const cache = new ResponseCache(makeConfig());
+    const gen = cache.generation('srv');
+    expect(cache.set('srv', 'read_file', { p: 1 }, 'fresh', gen)).toBe(true);
+  });
+
+  it('invalidation of one server does not bump another', () => {
+    const cache = new ResponseCache(makeConfig());
+    const gen = cache.generation('b');
+    cache.invalidateServer('a');
+    expect(cache.set('b', 'read_file', {}, 'x', gen)).toBe(true);
+  });
+});
+
+describe('edge cases', () => {
+  it('ttl 0 disables caching for that tool', () => {
+    const cache = new ResponseCache(makeConfig({ tool_ttls: { live_feed: 0 } }));
+    expect(cache.set('srv', 'live_feed', {}, 'x')).toBe(false);
+    expect(cache.size).toBe(0);
+  });
+
+  it('max_entries 0 stores nothing', () => {
+    const cache = new ResponseCache(makeConfig({ max_entries: 0 }));
+    expect(cache.set('srv', 'read_file', {}, 'x')).toBe(false);
+    expect(cache.size).toBe(0);
+  });
+
+  it('server names containing ":" do not leak into other servers on invalidation', () => {
+    const cache = new ResponseCache(makeConfig());
+    cache.set('a', 'read_file', {}, 'x');
+    cache.set('a:b', 'read_file', {}, 'y');
+    cache.invalidateServer('a');
+    expect(cache.get('a:b', 'read_file', {})).not.toBeNull();
+  });
+
+  it('keys ignore undefined members, like JSON', () => {
+    expect(stableHash({ a: 1, b: undefined })).toBe(stableHash({ a: 1 }));
+  });
+
+  it('hash is a full SHA-256 digest (no 32-bit collisions)', () => {
+    expect(stableHash({ a: 1 })).toHaveLength(43);
   });
 });

@@ -1,106 +1,119 @@
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
+import type { CompressionLevel } from './config.js';
+import { stableStringify } from './cache.js';
 
-export type CompressionLevel = 'none' | 'standard' | 'aggressive' | 'extreme' | 'maximum';
+export type { CompressionLevel } from './config.js';
+
+type Schema = Record<string, unknown>;
+
+const NAMESPACE_SEP = '__';
 
 /**
  * Compress a list of tools according to the specified level.
- * 'none' returns tools unchanged.
- * 'standard' and 'aggressive' apply Stage 1-3 structural cleanup.
- * 'extreme' embeds TS-style signatures in descriptions, strips inputSchema.
- * 'maximum' uses ultra-short types (s/n/b), ! for required, shared param extraction.
+ * - 'none' returns tools unchanged.
+ * - 'standard' / 'aggressive' apply structural cleanup + description trimming
+ *   (aggressive also strips obvious descriptions and dedupes repeated params).
+ * - 'extreme' embeds a TS-style signature in the description and strips inputSchema.
+ * - 'maximum' uses ultra-short types (s/n/b), `!` for required, and hoists params
+ *   shared by many tools of the same server into one note.
+ *
+ * Never mutates its input; tool names, annotations and _meta are always preserved.
  */
 export function compressTools(tools: Tool[], level: CompressionLevel): Tool[] {
   if (level === 'none') {
     return tools;
   }
 
-  // extreme/maximum: signature embedding pipeline
   if (level === 'extreme' || level === 'maximum') {
-    let result = tools.map((tool) => embedSignature(tool, level));
-    // Stage 5: shared param extraction for multi-tool sets
-    if (result.length >= 3) {
-      result = extractSharedParams(result, level);
-    }
-    return result;
+    return compressToSignatures(tools, level);
   }
 
   const compressed = tools.map((tool) => compressTool(tool, level));
-
-  // Stage 3: parameter deduplication (aggressive only)
   if (level === 'aggressive') {
     deduplicateParams(compressed);
   }
-
   return compressed;
 }
 
+function namespaceOf(toolName: string): string | undefined {
+  const sep = toolName.indexOf(NAMESPACE_SEP);
+  return sep > 0 ? toolName.slice(0, sep) : undefined;
+}
+
+function isSchema(v: unknown): v is Schema {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
 /**
- * Stage 3: For repeated property name + type combos across tools,
- * keep first occurrence's full definition and strip subsequent to { type } only.
+ * Tool-level fields signature embedding keeps: everything except the schemas it replaces
+ * (title, annotations, execution, icons, _meta and any future spec fields survive).
+ */
+function preservedFields(tool: Tool): Partial<Tool> {
+  const { name: _n, description: _d, inputSchema: _i, outputSchema: _o, ...rest } = tool;
+  return rest;
+}
+
+// ---------------------------------------------------------------------------
+// Stage 1–2: structural cleanup + description trimming (standard, aggressive)
+// ---------------------------------------------------------------------------
+
+/**
+ * Stage 3 (aggressive): when the same parameter (same name, same structure) appears in
+ * several tools of the same server, keep the description on the first one only.
+ * Structural keywords (type, enum, items, properties, ...) are never removed.
  */
 function deduplicateParams(tools: Tool[]): void {
-  // Map of "propName:type" → true (already seen)
-  const seen = new Map<string, boolean>();
+  const seen = new Set<string>();
 
   for (const tool of tools) {
-    const props = (tool as any).inputSchema?.properties as Record<string, Record<string, unknown>> | undefined;
-    if (!props) continue;
+    const props = (tool.inputSchema as Schema | undefined)?.properties;
+    if (!isSchema(props)) continue;
+    const ns = namespaceOf(tool.name) ?? '';
 
     for (const [propName, prop] of Object.entries(props)) {
-      const propType = typeof prop['type'] === 'string' ? prop['type'] : 'unknown';
-      const key = `${propName}:${propType}`;
-
+      if (!isSchema(prop)) continue;
+      const { description: _d, examples: _e, ...structure } = prop;
+      const key = `${ns}\u0000${propName}\u0000${stableStringify(structure)}`;
       if (seen.has(key)) {
-        // Strip to minimal — keep only type
-        const type = prop['type'];
-        for (const k of Object.keys(prop)) {
-          if (k !== 'type') delete prop[k];
-        }
-        if (type !== undefined) prop['type'] = type;
+        delete prop.description;
+        delete prop.examples;
       } else {
-        seen.set(key, true);
+        seen.add(key);
       }
     }
   }
 }
 
 function compressTool(tool: Tool, level: CompressionLevel): Tool {
-  // Deep clone to avoid mutating input
-  const cloned = structuredClone(tool) as any;
+  const cloned = structuredClone(tool) as Tool & { description?: string };
 
-  // Remove empty description at tool level
-  if (typeof cloned.description === 'string' && cloned.description === '') {
+  if (cloned.description === '') {
     delete cloned.description;
   }
 
-  // Guard: if no inputSchema, return as-is
-  if (!cloned.inputSchema || typeof cloned.inputSchema !== 'object') {
-    return cloned as Tool;
+  const schema = cloned.inputSchema as Schema | undefined;
+  if (!isSchema(schema)) {
+    return cloned;
   }
 
-  // Clean top-level schema (removes additionalProperties, $schema from the schema object)
-  cleanSchema(cloned.inputSchema);
+  cleanSchema(schema);
 
-  // Recurse into properties
-  if (cloned.inputSchema.properties && typeof cloned.inputSchema.properties === 'object') {
-    for (const key of Object.keys(cloned.inputSchema.properties)) {
-      cloned.inputSchema.properties[key] = cleanProperty(cloned.inputSchema.properties[key]);
+  const props = isSchema(schema.properties) ? (schema.properties as Record<string, unknown>) : undefined;
+  if (props) {
+    for (const key of Object.keys(props)) {
+      props[key] = cleanProperty(props[key]);
     }
   }
 
   // Stage 2: description trimming
   const toolDescLimit = level === 'aggressive' ? 100 : 200;
-
   if (typeof cloned.description === 'string') {
     cloned.description = truncateDesc(cloned.description, toolDescLimit);
   }
 
-  if (cloned.inputSchema.properties && typeof cloned.inputSchema.properties === 'object') {
-    for (const key of Object.keys(cloned.inputSchema.properties)) {
-      const prop = cloned.inputSchema.properties[key];
-      if (!prop || typeof prop !== 'object') continue;
-      if (typeof prop.description !== 'string') continue;
-
+  if (props) {
+    for (const [key, prop] of Object.entries(props)) {
+      if (!isSchema(prop) || typeof prop.description !== 'string') continue;
       if (level === 'aggressive' && shouldStripDescription(key, prop.description)) {
         delete prop.description;
       } else {
@@ -109,199 +122,123 @@ function compressTool(tool: Tool, level: CompressionLevel): Tool {
     }
   }
 
-  return cloned as Tool;
+  return cloned;
 }
 
-/**
- * Remove structural noise from a schema object (top-level only, not recursive into properties).
- */
-function cleanSchema(schema: Record<string, unknown>): void {
+/** Remove structural noise from the top-level schema object. */
+function cleanSchema(schema: Schema): void {
   if (schema.additionalProperties === false) {
     delete schema.additionalProperties;
   }
-  if ('$schema' in schema) {
-    delete schema.$schema;
-  }
+  delete schema.$schema;
 }
 
-/**
- * Clean a single property definition and recurse into nested structures.
- */
+/** Clean a single property definition and recurse into nested structures. */
 function cleanProperty(prop: unknown): unknown {
-  if (!prop || typeof prop !== 'object' || Array.isArray(prop)) {
+  if (!isSchema(prop)) {
     return prop;
   }
+  const p = prop;
 
-  const p = prop as Record<string, unknown>;
+  if (p.additionalProperties === false) delete p.additionalProperties;
+  delete p.$schema;
+  if (p.description === '') delete p.description;
+  delete p.title;
 
-  // Remove additionalProperties: false
-  if (p.additionalProperties === false) {
-    delete p.additionalProperties;
-  }
-
-  // Remove $schema
-  if ('$schema' in p) {
-    delete p.$schema;
-  }
-
-  // Remove empty description
-  if (typeof p.description === 'string' && p.description === '') {
+  if ('default' in p && typeof p.description === 'string' && isDefaultRestatingDescription(p.description, p.default)) {
     delete p.description;
   }
 
-  // Remove title from property schemas
-  if ('title' in p) {
-    delete p.title;
-  }
-
-  // Remove default-restating description
-  if ('default' in p && typeof p.description === 'string') {
-    if (isDefaultRestatingDescription(p.description, p.default)) {
-      delete p.description;
-    }
-  }
-
-  // Flatten single-element anyOf/oneOf
   for (const keyword of ['anyOf', 'oneOf'] as const) {
-    if (Array.isArray(p[keyword])) {
-      const arr = p[keyword] as unknown[];
-      if (arr.length === 1) {
-        const inner = arr[0];
-        delete p[keyword];
-        Object.assign(p, inner);
-        // Re-process after merge
-        return cleanProperty(p);
-      } else if (keyword === 'anyOf' && arr.length === 2) {
-        // Nullable pattern: [{ type: "X" }, { type: "null" }] or reversed
-        const nonNull = arr.filter((x) => (x as any)?.type !== 'null');
-        const hasNull = arr.some((x) => (x as any)?.type === 'null');
-        if (hasNull && nonNull.length === 1) {
-          delete p[keyword];
-          Object.assign(p, nonNull[0]);
-          p.nullable = true;
-          return cleanProperty(p);
+    const variants = p[keyword];
+    if (!Array.isArray(variants)) continue;
+
+    if (variants.length === 1 && isSchema(variants[0])) {
+      // Single variant: inline it. Outer keys (description, default) win over inner ones.
+      const { [keyword]: _drop, ...outer } = p;
+      return cleanProperty({ ...variants[0], ...outer });
+    }
+
+    if (keyword === 'anyOf' && variants.length === 2) {
+      // Nullable pattern: [{ type: X, ... }, { type: "null" }] in either order
+      const nullIdx = variants.findIndex((x) => isSchema(x) && x.type === 'null' && Object.keys(x).length === 1);
+      const other = variants[1 - nullIdx];
+      if (nullIdx !== -1 && isSchema(other) && typeof other.type === 'string' && other.type !== 'null') {
+        const { anyOf: _drop, ...outer } = p;
+        const merged: Schema = { ...other, ...outer, type: [other.type, 'null'] };
+        if (Array.isArray(merged.enum) && !merged.enum.includes(null)) {
+          merged.enum = [...merged.enum, null];
         }
+        return cleanProperty(merged);
       }
     }
   }
 
-  // Recurse into nested properties
-  if (p.properties && typeof p.properties === 'object' && !Array.isArray(p.properties)) {
-    const nested = p.properties as Record<string, unknown>;
+  if (isSchema(p.properties)) {
+    const nested = p.properties;
     for (const key of Object.keys(nested)) {
       nested[key] = cleanProperty(nested[key]);
     }
   }
 
-  // Recurse into items (array schemas)
-  if (p.items && typeof p.items === 'object') {
+  if (isSchema(p.items)) {
     p.items = cleanProperty(p.items);
   }
 
   return p;
 }
 
-/**
- * Check if a description merely restates the default value.
- * Patterns: "Default: X" or "Defaults to X"
- */
+/** Check if a description merely restates the default value ("Default: X" / "Defaults to X"). */
 function isDefaultRestatingDescription(description: string, defaultValue: unknown): boolean {
-  const trimmed = description.trim();
-
-  // "Default: X" pattern
-  const defaultColonMatch = /^Default:\s*(.+)$/i.exec(trimmed);
-  if (defaultColonMatch) {
-    const stated = defaultColonMatch[1].trim();
-    return statedValueMatchesDefault(stated, defaultValue);
-  }
-
-  // "Defaults to X" pattern
-  const defaultsToMatch = /^Defaults to\s+(.+)$/i.exec(trimmed);
-  if (defaultsToMatch) {
-    const stated = defaultsToMatch[1].trim();
-    return statedValueMatchesDefault(stated, defaultValue);
-  }
-
-  return false;
-}
-
-function statedValueMatchesDefault(stated: string, defaultValue: unknown): boolean {
-  // Compare string representation
-  if (String(defaultValue) === stated) {
-    return true;
-  }
-  // Try numeric comparison
+  const match = /^(?:Default:|Defaults to)\s*(.+?)\.?$/i.exec(description.trim());
+  if (!match) return false;
+  const stated = match[1].trim().replace(/^["'`](.*)["'`]$/, '$1');
+  if (String(defaultValue) === stated) return true;
   const num = Number(stated);
-  if (!isNaN(num) && num === defaultValue) {
-    return true;
-  }
-  return false;
+  return stated !== '' && !Number.isNaN(num) && num === defaultValue;
 }
 
 /**
- * Truncate a description to maxLen characters, preserving the first sentence if possible.
- * Splits on ". " (period followed by space). Hard-truncates at maxLen if no boundary found.
+ * Truncate a description to at most maxLen characters, preferring the last sentence
+ * boundary, then the last word boundary, then a hard cut.
  */
-function truncateDesc(desc: string, maxLen: number): string {
+export function truncateDesc(desc: string, maxLen: number): string {
   if (desc.length <= maxLen) {
     return desc;
   }
-  // Try to find a sentence boundary before maxLen
-  const candidate = desc.slice(0, maxLen + 1); // +1 to catch ". " at boundary
+  const candidate = desc.slice(0, maxLen + 1); // +1 to catch ". " at the boundary
   const sentenceEnd = candidate.lastIndexOf('. ');
   if (sentenceEnd > 0) {
-    return desc.slice(0, sentenceEnd + 1); // include the period
+    return desc.slice(0, sentenceEnd + 1);
   }
-  // Also check if the description ends with a period within the limit
-  const periodAtEnd = desc.slice(0, maxLen).lastIndexOf('.');
-  if (periodAtEnd > 0 && periodAtEnd === desc.length - 1) {
-    return desc.slice(0, maxLen);
+  const wordEnd = desc.slice(0, maxLen + 1).lastIndexOf(' ');
+  if (wordEnd > maxLen / 2) {
+    return desc.slice(0, wordEnd).trimEnd();
   }
-  // Hard truncate
   return desc.slice(0, maxLen);
 }
 
-/**
- * Obvious parameter names whose descriptions can be stripped in aggressive mode.
- */
+/** Obvious parameter names whose descriptions can be stripped in aggressive mode. */
 const OBVIOUS_PARAM_NAMES = new Set<string>([
   'path', 'query', 'url', 'name', 'id', 'content', 'message', 'owner', 'repo',
   'file', 'directory', 'pattern', 'limit', 'offset', 'cursor', 'format', 'title',
   'description', 'body', 'text', 'value', 'key', 'type', 'label', 'tag', 'ref',
 ]);
 
-/**
- * Patterns that indicate the description has non-obvious constraints worth keeping.
- */
+/** Patterns that indicate the description has non-obvious constraints worth keeping. */
 const NON_OBVIOUS_PATTERN = /:\s*\w.*,|must|between|one of|format|enum/i;
 
-/**
- * In aggressive mode, decide whether to fully strip a property description.
- * Returns true (strip) when:
- * - The property name is in OBVIOUS_PARAM_NAMES, OR
- * - The description merely restates the property name (fuzzy match)
- * Returns false (keep) when the description contains enum values, specific formats,
- * or non-obvious constraints.
- */
 function shouldStripDescription(propName: string, description: string): boolean {
-  // Keep if it has non-obvious constraints
   if (NON_OBVIOUS_PATTERN.test(description)) {
     return false;
   }
-
-  // Strip if it's an obvious param name
   if (OBVIOUS_PARAM_NAMES.has(propName)) {
     return true;
   }
-
-  // Strip if description merely restates the property name
-  // Fuzzy: lowercase description, strip articles, check if it contains the prop name
+  // Strip if the description merely restates the (non-trivial) property name
+  if (propName.length < 3) return false;
   const normalized = description.toLowerCase().replace(/\b(a|an|the|of|for|to|in)\b/g, '').replace(/\s+/g, ' ').trim();
-  if (normalized.includes(propName.toLowerCase())) {
-    return true;
-  }
-
-  return false;
+  return normalized.includes(propName.toLowerCase());
 }
 
 // ---------------------------------------------------------------------------
@@ -312,177 +249,170 @@ const SHORT_TYPES: Record<string, string> = {
   string: 's', number: 'n', integer: 'n', boolean: 'b', object: 'obj', array: 'arr', null: 'null',
 };
 
-export function formatType(schema: Record<string, unknown>, short: boolean): string {
-  const type = schema.type as string | undefined;
+const MAX_TYPE_DEPTH = 6;
 
-  // Enum
-  if (Array.isArray(schema.enum)) {
-    const vals = (schema.enum as unknown[]).map(v => JSON.stringify(v)).join('|');
-    return vals;
+function resolveRef(ref: string, root: Schema | undefined): Schema | undefined {
+  const m = /^#\/(\$defs|definitions)\/(.+)$/.exec(ref);
+  if (!m || !root) return undefined;
+  const defs = root[m[1]];
+  if (!isSchema(defs)) return undefined;
+  const target = defs[m[2].replace(/~1/g, '/').replace(/~0/g, '~')];
+  return isSchema(target) ? target : undefined;
+}
+
+function shortType(type: string, short: boolean): string {
+  return short ? (SHORT_TYPES[type] ?? type) : type;
+}
+
+/** Render a JSON Schema fragment as a compact TS-like type string. */
+export function formatType(schema: Schema, short: boolean, root?: Schema, depth = 0): string {
+  const fallback = short ? 's' : 'string';
+  if (depth > MAX_TYPE_DEPTH) return short ? 'obj' : 'object';
+
+  if (typeof schema.$ref === 'string') {
+    const target = resolveRef(schema.$ref, root);
+    return target ? formatType(target, short, root, depth + 1) : short ? 'obj' : 'object';
   }
 
-  // Array with items
+  if ('const' in schema) return JSON.stringify(schema.const);
+
+  if (Array.isArray(schema.enum)) {
+    return schema.enum.map((v) => JSON.stringify(v)).join('|');
+  }
+
+  const type = schema.type;
+
+  if (Array.isArray(type)) {
+    const parts = type
+      .filter((t): t is string => typeof t === 'string')
+      .map((t) => (t === 'null' ? 'null' : formatType({ ...schema, type: t }, short, root, depth + 1)));
+    return [...new Set(parts)].join('|') || fallback;
+  }
+
   if (type === 'array') {
-    const items = schema.items as Record<string, unknown> | undefined;
-    if (items) {
-      const inner = formatType(items, short);
-      return `${inner}[]`;
+    if (isSchema(schema.items)) {
+      const inner = formatType(schema.items, short, root, depth + 1);
+      return inner.includes('|') ? `(${inner})[]` : `${inner}[]`;
     }
     return short ? 'arr' : 'array';
   }
 
-  // Nested object with properties
-  if (type === 'object' && schema.properties && typeof schema.properties === 'object') {
-    const props = schema.properties as Record<string, Record<string, unknown>>;
-    const innerReq = new Set(Array.isArray(schema.required) ? schema.required as string[] : []);
+  if (type === 'object' && isSchema(schema.properties)) {
+    const props = schema.properties;
+    const innerReq = new Set(Array.isArray(schema.required) ? (schema.required as string[]) : []);
     const parts = Object.entries(props).map(([name, prop]) => {
-      const t = formatType(prop, short);
+      const t = isSchema(prop) ? formatType(prop, short, root, depth + 1) : fallback;
       const req = innerReq.has(name) ? (short ? '!' : '') : '?';
       return short ? `${name}:${t}${req}` : `${name}: ${t}${req}`;
     });
     return `{${parts.join(short ? ' ' : ', ')}}`;
   }
 
-  // Simple type
-  if (type) {
-    if (schema.nullable === true) {
-      const base = short ? (SHORT_TYPES[type] || type) : type;
-      return `${base}|null`;
-    }
-    return short ? (SHORT_TYPES[type] || type) : type;
+  if (typeof type === 'string') {
+    const base = shortType(type, short);
+    return schema.nullable === true ? `${base}|null` : base;
   }
 
-  // anyOf/oneOf
   for (const kw of ['anyOf', 'oneOf'] as const) {
-    if (Array.isArray(schema[kw])) {
-      const variants = (schema[kw] as Record<string, unknown>[])
-        .map(v => formatType(v, short))
-        .filter(Boolean);
-      return variants.join('|');
+    const variants = schema[kw];
+    if (Array.isArray(variants)) {
+      const rendered = variants.filter(isSchema).map((v) => formatType(v, short, root, depth + 1));
+      return [...new Set(rendered)].join('|') || fallback;
     }
   }
 
-  return short ? 's' : 'string';
+  if (Array.isArray(schema.allOf)) {
+    const rendered = schema.allOf.filter(isSchema).map((v) => formatType(v, short, root, depth + 1));
+    return rendered.join('&') || fallback;
+  }
+
+  return fallback;
 }
 
-export function embedSignature(tool: Tool, level: 'extreme' | 'maximum'): Tool {
-  const short = level === 'maximum';
-  const schema = (tool as any).inputSchema;
-  const props = schema?.properties as Record<string, Record<string, unknown>> | undefined;
+interface Signature {
+  tool: Tool;
+  desc: string;
+  /** Rendered parameter tokens, e.g. "path:s!" or "path: string (required)". */
+  params: string[];
+}
 
-  if (!props || Object.keys(props).length === 0) {
-    const desc = tool.description || tool.name;
-    return {
-      name: tool.name,
-      description: short ? truncateDesc(desc, 80) : truncateDesc(desc, 150),
-      inputSchema: { type: 'object' as const },
-    };
-  }
-
-  const required = new Set(Array.isArray(schema.required) ? schema.required as string[] : []);
+function buildSignature(tool: Tool, short: boolean): Signature {
+  const schema = tool.inputSchema as Schema | undefined;
+  const props = isSchema(schema?.properties) ? (schema!.properties as Record<string, unknown>) : {};
+  const required = new Set(Array.isArray(schema?.required) ? (schema!.required as string[]) : []);
 
   const params = Object.entries(props).map(([name, prop]) => {
-    const type = formatType(prop, short);
-    if (short) {
-      const req = required.has(name) ? '!' : '';
-      return `${name}:${type}${req}`;
-    } else {
-      const req = required.has(name) ? ' (required)' : '';
-      return `${name}: ${type}${req}`;
-    }
+    const type = isSchema(prop) ? formatType(prop, short, schema) : short ? 's' : 'string';
+    if (short) return `${name}:${type}${required.has(name) ? '!' : ''}`;
+    return `${name}: ${type}${required.has(name) ? ' (required)' : ''}`;
   });
 
-  const prefix = short ? 'P:' : 'Params:';
-  const sep = short ? ' ' : ', ';
-  const paramStr = `${prefix} ${params.join(sep)}`;
+  const baseDesc = (tool.description || tool.name).trim();
+  const limit = params.length === 0 ? (short ? 80 : 150) : short ? 60 : 120;
+  return { tool, desc: truncateDesc(baseDesc, limit), params };
+}
 
-  const baseDesc = tool.description || tool.name;
-  const trimmedDesc = short ? truncateDesc(baseDesc, 60) : truncateDesc(baseDesc, 120);
-  const description = `${trimmedDesc}. ${paramStr}`;
-
+function renderSignature(sig: Signature, short: boolean, prefixNote?: string): Tool {
+  let description = sig.desc;
+  if (sig.params.length > 0) {
+    const sep = short ? ' ' : ', ';
+    const body = `${short ? 'P:' : 'Params:'} ${sig.params.join(sep)}`;
+    description = `${description.replace(/[.\s]+$/, '')}. ${body}`;
+  }
+  if (prefixNote) description = `${prefixNote} ${description}`;
   return {
-    name: tool.name,
+    name: sig.tool.name,
     description,
     inputSchema: { type: 'object' as const },
+    ...preservedFields(sig.tool),
   };
 }
 
-// ---------------------------------------------------------------------------
-// Stage 5: Shared parameter extraction (extreme + maximum, 3+ tools)
-// ---------------------------------------------------------------------------
-
-export function extractSharedParams(tools: Tool[], level: 'extreme' | 'maximum'): Tool[] {
+/** Embed a single tool's parameter signature in its description. */
+export function embedSignature(tool: Tool, level: 'extreme' | 'maximum'): Tool {
   const short = level === 'maximum';
-  const prefix = short ? 'P:' : 'Params:';
+  return renderSignature(buildSignature(tool, short), short);
+}
 
-  // Group tools by server namespace
-  const groups = new Map<string, { indices: number[]; paramCounts: Map<string, number> }>();
+// ---------------------------------------------------------------------------
+// Stage 5: Shared parameter extraction (extreme + maximum, 3+ tools per server)
+// ---------------------------------------------------------------------------
 
-  for (let i = 0; i < tools.length; i++) {
-    const name = tools[i].name;
-    const sep = name.indexOf('__');
-    const server = sep > 0 ? name.slice(0, sep) : '_default';
+function compressToSignatures(tools: Tool[], level: 'extreme' | 'maximum'): Tool[] {
+  const short = level === 'maximum';
+  const sigs = tools.map((t) => buildSignature(t, short));
+  const notes = new Map<number, string>();
 
-    if (!groups.has(server)) {
-      groups.set(server, { indices: [], paramCounts: new Map() });
+  // Group by server namespace; un-namespaced tools form one group.
+  const groups = new Map<string, number[]>();
+  sigs.forEach((sig, i) => {
+    const ns = namespaceOf(sig.tool.name) ?? '';
+    const g = groups.get(ns);
+    if (g) g.push(i);
+    else groups.set(ns, [i]);
+  });
+
+  for (const [ns, indices] of groups) {
+    if (indices.length < 3) continue;
+
+    const counts = new Map<string, number>();
+    for (const i of indices) {
+      for (const p of new Set(sigs[i].params)) counts.set(p, (counts.get(p) ?? 0) + 1);
     }
-    const group = groups.get(server)!;
-    group.indices.push(i);
+    const threshold = Math.min(3, Math.ceil(indices.length * 0.6));
+    const shared = [...counts].filter(([, c]) => c >= threshold).map(([p]) => p);
+    if (shared.length === 0) continue;
 
-    // Extract params from the signature in the description
-    const desc = tools[i].description || '';
-    const prefixEscaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const paramMatch = desc.match(new RegExp(`${prefixEscaped}\\s*(.+)$`));
-    if (paramMatch) {
-      const paramSection = paramMatch[1];
-      const paramList = short
-        ? paramSection.split(/\s+/).filter(Boolean)
-        : paramSection.split(/,\s*/).filter(Boolean);
-      for (const p of paramList) {
-        group.paramCounts.set(p, (group.paramCounts.get(p) || 0) + 1);
-      }
+    const sharedSet = new Set(shared);
+    for (const i of indices) {
+      sigs[i] = { ...sigs[i], params: sigs[i].params.filter((p) => !sharedSet.has(p)) };
     }
+    const label = ns ? `${ns} shared` : 'shared';
+    notes.set(
+      indices[0],
+      short ? `[${label}: ${shared.join(' ')}]` : `[${label} params: ${shared.join(', ')}]`,
+    );
   }
 
-  const result = [...tools];
-  for (const [server, group] of groups) {
-    if (group.indices.length < 3) continue;
-
-    const threshold = Math.min(3, Math.ceil(group.indices.length * 0.6));
-    const sharedParams: string[] = [];
-    for (const [param, count] of group.paramCounts) {
-      if (count >= threshold) {
-        sharedParams.push(param);
-      }
-    }
-    if (sharedParams.length === 0) continue;
-
-    // Prepend shared note to first tool in group
-    const sharedNote = short
-      ? `[${server} shared: ${sharedParams.join(' ')}]`
-      : `[${server} shared params: ${sharedParams.join(', ')}]`;
-
-    const firstIdx = group.indices[0];
-    result[firstIdx] = {
-      ...result[firstIdx],
-      description: `${sharedNote} ${result[firstIdx].description || ''}`,
-    };
-
-    // Remove shared params from each tool's signature
-    for (const idx of group.indices) {
-      let desc = result[idx].description || '';
-      for (const sp of sharedParams) {
-        const escaped = sp.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        // Remove with surrounding separators
-        desc = desc.replace(new RegExp(`,?\\s*${escaped}`), '');
-        desc = desc.replace(new RegExp(`${escaped},?\\s*`), '');
-      }
-      // Clean up empty param sections
-      desc = desc.replace(/Params:\s*$/g, '').replace(/P:\s*$/g, '');
-      desc = desc.replace(/\.\s*$/g, '.').trim();
-      result[idx] = { ...result[idx], description: desc };
-    }
-  }
-
-  return result;
+  return sigs.map((sig, i) => renderSignature(sig, short, notes.get(i)));
 }

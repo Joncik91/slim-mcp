@@ -1,593 +1,520 @@
+import { basename } from 'node:path';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
 import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
   ListResourcesRequestSchema,
+  ListResourceTemplatesRequestSchema,
   ReadResourceRequestSchema,
   ListPromptsRequestSchema,
   GetPromptRequestSchema,
+  isJSONRPCErrorResponse,
+  isJSONRPCNotification,
+  isJSONRPCRequest,
+  isJSONRPCResultResponse,
+  type CallToolResult,
+  type JSONRPCMessage,
+  type Prompt,
+  type RequestId,
+  type Resource,
+  type ResourceTemplate,
+  type ServerCapabilities,
+  type Tool,
 } from '@modelcontextprotocol/sdk/types.js';
-import { info, debug, error } from './logger.js';
-import { compressTools, type CompressionLevel } from './compress.js';
-import { estimateTokens, formatCompressionReport } from './tokens.js';
-import { createServerManager, parseNamespacedToolName } from './server-manager.js';
-import { ResponseCache, NEVER_CACHE_PATTERNS } from './cache.js';
-import { createLazyToolManager, formatLazyReport } from './lazy.js';
-import type { LazyToolManager } from './lazy.js';
-import type { CacheConfig } from './config.js';
-import type { McpSlimConfig } from './config.js';
+import { info, debug, error, warn } from './logger.js';
+import type { CompressionLevel } from './compress.js';
+import { createServerManager, parseNamespacedToolName, childEnv, type ServerManager } from './server-manager.js';
+import { ResponseCache } from './cache.js';
+import { createLazyToolManager, type LazyToolManager } from './lazy.js';
+import { DEFAULT_CACHE, type McpSlimConfig } from './config.js';
+import { ToolPipeline, type CallTicket, type ResolvedTool } from './pipeline.js';
+import { startDashboard, type DashboardConfig, type DashboardHandle } from './dashboard.js';
 import { stats } from './stats.js';
+import { VERSION } from './version.js';
 
 // ---------------------------------------------------------------------------
 // Option types
 // ---------------------------------------------------------------------------
 
-export interface SingleServerOptions {
+interface CommonOptions {
+  noCache?: boolean;
+  noLazy?: boolean;
+  maxTools?: number;
+  /** Start the stats dashboard once upstream servers are up. */
+  dashboard?: DashboardConfig;
+}
+
+export interface SingleServerOptions extends CommonOptions {
   mode: 'single';
   command: string;
   args: string[];
   compression: CompressionLevel;
-  noCache?: boolean;
-  noLazy?: boolean;
-  maxTools?: number;
 }
 
-export interface MultiServerOptions {
+export interface MultiServerOptions extends CommonOptions {
   mode: 'multi';
   config: McpSlimConfig;
-  noCache?: boolean;
-  noLazy?: boolean;
-  maxTools?: number;
 }
+
+export type ProxyOptions = SingleServerOptions | MultiServerOptions;
+
+/** Lazy loading turns on automatically above this many tools. */
+export const LAZY_AUTO_THRESHOLD = 15;
+export const DEFAULT_MAX_TOOLS = 8;
+const SINGLE_SERVER_KEY = '_single';
+
+// ---------------------------------------------------------------------------
+// Shutdown coordination
+// ---------------------------------------------------------------------------
 
 /**
- * Union type for proxy options.
- * When `mode` is absent (legacy callers), it is treated as 'single'.
+ * Run `cleanup` once, on the first of: SIGINT, SIGTERM, SIGHUP, stdin EOF (the MCP stdio
+ * shutdown signal), or an explicit trigger. Then exit with the given code.
  */
-export type ProxyOptions =
-  | SingleServerOptions
-  | MultiServerOptions
-  | { command: string; args: string[]; compression?: CompressionLevel };
-
-// ---------------------------------------------------------------------------
-// Request tracker (used by single-server mode, exported for tests)
-// ---------------------------------------------------------------------------
-
-export interface RequestTracker {
-  trackRequest(msg: { id: string | number; method: string }): void;
-  isToolsListResponse(id: string | number): boolean;
-  consume(id: string | number): void;
-}
-
-export function createRequestTracker(): RequestTracker {
-  const pending = new Set<string | number>();
-  return {
-    trackRequest(msg: { id: string | number; method: string }) {
-      if (msg.method === 'tools/list') pending.add(msg.id);
-    },
-    isToolsListResponse(id: string | number): boolean {
-      return pending.has(id);
-    },
-    consume(id: string | number) {
-      pending.delete(id);
-    },
+function installShutdown(cleanup: () => Promise<void>): (code?: number) => void {
+  let started = false;
+  const run = (code = 0) => {
+    if (started) return;
+    started = true;
+    const hardExit = setTimeout(() => process.exit(code), 10_000);
+    hardExit.unref();
+    cleanup()
+      .catch((err) => error(`Shutdown failed: ${err instanceof Error ? err.message : String(err)}`))
+      .finally(() => process.exit(code));
   };
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+    process.once(sig, () => {
+      debug(`Received ${sig}`);
+      run(0);
+    });
+  }
+  process.stdin.once('end', () => {
+    debug('Agent closed stdin');
+    run(0);
+  });
+  return run;
+}
+
+function makeLazy(enabled: boolean, maxTools: number, alwaysLoad: Set<string>): LazyToolManager | null {
+  return enabled ? createLazyToolManager({ maxToolsLoaded: maxTools, alwaysLoad }) : null;
 }
 
 // ---------------------------------------------------------------------------
-// Compression helper (exported for tests)
+// Single-server proxy: transparent JSON-RPC pass-through with interception
 // ---------------------------------------------------------------------------
 
-export function maybeCompressResponse(
-  message: any,
-  tracker: RequestTracker,
-  level: CompressionLevel,
-): any | null {
-  if (!('result' in message) || !('id' in message)) return null;
-  if (!tracker.isToolsListResponse(message.id)) return null;
+interface PendingRequest {
+  method: string;
+  ticket?: CallTicket;
+}
 
-  tracker.consume(message.id);
+/** Tracks agent → upstream requests by id until the upstream answers. */
+export class PendingRequests {
+  private readonly map = new Map<RequestId, PendingRequest>();
 
-  const result = message.result;
-  if (!result || !Array.isArray(result.tools)) return null;
-  if (level === 'none') return null;
-
-  const before = estimateTokens(result.tools);
-  const compressed = compressTools(result.tools, level);
-  const after = estimateTokens(compressed);
-
-  info(formatCompressionReport({ toolCount: compressed.length, beforeTokens: before, afterTokens: after }));
-
-  for (let i = 0; i < result.tools.length; i++) {
-    const origTokens = estimateTokens(result.tools[i]);
-    const compTokens = estimateTokens(compressed[i]);
-    if (origTokens !== compTokens) {
-      debug(`  ${compressed[i].name}: ${origTokens} → ${compTokens} tokens`);
-    }
+  track(id: RequestId, entry: PendingRequest): void {
+    this.map.set(id, entry);
   }
 
-  return { ...message, result: { ...result, tools: compressed } };
-}
+  /** Remove and return the entry for a response id. */
+  take(id: RequestId): PendingRequest | undefined {
+    const entry = this.map.get(id);
+    this.map.delete(id);
+    return entry;
+  }
 
-// ---------------------------------------------------------------------------
-// Single-server proxy (M1/M2 transparent pass-through)
-// ---------------------------------------------------------------------------
+  get size(): number {
+    return this.map.size;
+  }
+
+  drain(): PendingRequest[] {
+    const all = [...this.map.values()];
+    this.map.clear();
+    return all;
+  }
+}
 
 async function startSingleServerProxy(options: SingleServerOptions): Promise<void> {
   const level: CompressionLevel = options.compression ?? 'standard';
-  const tracker = createRequestTracker();
-
-  // Cache setup
-  const cacheEnabled = !options.noCache;
-  const cache = cacheEnabled
-    ? new ResponseCache({ enabled: true, default_ttl: 60, max_entries: 1000 })
-    : null;
-
-  // Lazy loading setup (deferred until we know tool count)
+  const cache = options.noCache ? null : new ResponseCache({ ...DEFAULT_CACHE });
   const lazyDisabled = options.noLazy === true;
-  const maxTools = options.maxTools ?? 8;
-  let lazyManager: LazyToolManager | null = null;
+  const maxTools = options.maxTools ?? DEFAULT_MAX_TOOLS;
+  const serverLabel = basename(options.args.find((a) => !a.startsWith('-')) ?? options.command);
 
-  // Track tools/call requests for cache: id → { toolName, args }
-  const pendingToolCalls = new Map<string | number, { toolName: string; args: Record<string, unknown> }>();
+  const resolve = (toolName: string): ResolvedTool => ({ server: SINGLE_SERVER_KEY, tool: toolName });
+  const pipeline = new ToolPipeline({ level, cache, lazy: null, resolve });
+  const pending = new PendingRequests();
 
-  const upstreamTransport = new StdioClientTransport({
+  const upstream = new StdioClientTransport({
     command: options.command,
     args: options.args,
+    env: childEnv(),
     stderr: 'inherit',
   });
+  const downstream = new StdioServerTransport();
 
-  const downstreamTransport = new StdioServerTransport();
+  const sendDown = (message: JSONRPCMessage, what: string) => {
+    downstream.send(message).catch((err) => error(`Failed to send ${what} to agent: ${err}`));
+  };
 
-  upstreamTransport.onmessage = (message: JSONRPCMessage) => {
-    debug(`← upstream: ${JSON.stringify(message)}`);
-    let outMessage: any = message;
+  pipeline.onToolListChanged = () => {
+    sendDown({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }, 'tools/list_changed');
+  };
 
-    // Check if this is a tools/list response
-    if ('result' in message && 'id' in message && tracker.isToolsListResponse((message as any).id)) {
-      tracker.consume((message as any).id);
-      const result = (message as any).result;
-      if (result && Array.isArray(result.tools)) {
-        let tools = result.tools;
+  upstream.onmessage = (message: JSONRPCMessage) => {
+    debug(() => `← upstream: ${JSON.stringify(message)}`);
+    let out: JSONRPCMessage = message;
 
-        // Initialize lazy manager on first tools/list if not disabled
-        if (!lazyDisabled && !lazyManager && tools.length > 15) {
-          lazyManager = createLazyToolManager({ maxToolsLoaded: maxTools, alwaysLoad: new Set() });
-        }
+    if (isJSONRPCResultResponse(message) || isJSONRPCErrorResponse(message)) {
+      const req = message.id !== undefined ? pending.take(message.id) : undefined;
 
-        // Apply lazy loading BEFORE compression
-        if (lazyManager) {
-          tools = lazyManager.getToolList(tools);
-          const report = lazyManager.getReport();
-          if (report) {
-            info(formatLazyReport(report));
+      if (req && isJSONRPCResultResponse(message)) {
+        const result = message.result as Record<string, unknown>;
+
+        if (req.method === 'initialize' && !lazyDisabled) {
+          // Advertise listChanged so the agent re-fetches tools after a lazy promotion.
+          const caps = result.capabilities as ServerCapabilities | undefined;
+          if (caps?.tools) {
+            out = { ...message, result: { ...result, capabilities: { ...caps, tools: { ...caps.tools, listChanged: true } } } };
           }
-        }
-
-        // Apply compression only to full tools
-        if (level !== 'none') {
-          const before = estimateTokens(tools);
-          if (lazyManager) {
-            // Compress only full tools, pass slim tools through
-            const compressed = tools.map((t: any) =>
-              lazyManager!.isSlim(t.name) ? t : compressTools([t], level)[0]
-            );
-            tools = compressed;
-          } else {
-            tools = compressTools(tools, level);
+        } else if (req.method === 'tools/list' && Array.isArray(result.tools)) {
+          const tools = result.tools as Tool[];
+          const paginated = typeof result.nextCursor === 'string';
+          if (!lazyDisabled && !pipeline.lazyManager && !paginated && tools.length > LAZY_AUTO_THRESHOLD) {
+            pipeline.setLazyManager(makeLazy(true, maxTools, new Set()));
           }
-          const after = estimateTokens(tools);
-          info(formatCompressionReport({ toolCount: tools.length, beforeTokens: before, afterTokens: after }));
-        }
-
-        outMessage = { ...message, result: { ...result, tools } };
-      }
-    } else {
-      // Cache the response if it's a tools/call result
-      if (cache && 'result' in outMessage && 'id' in outMessage) {
-        const pending = pendingToolCalls.get(outMessage.id as string | number);
-        if (pending) {
-          pendingToolCalls.delete(outMessage.id as string | number);
-          const result = (outMessage as any).result;
-          // Only cache successful responses (no isError flag)
-          if (result && !result.isError) {
-            cache.set('_single', pending.toolName, pending.args, result);
-            debug(`Cache miss: ${pending.toolName} → caching for ${cache['config'].default_ttl}s`);
+          if (paginated && pipeline.lazyManager) {
+            debug('Paginated tools/list: lazy loading skipped for this page');
           }
+          const lazy = pipeline.lazyManager;
+          if (paginated) pipeline.setLazyManager(null);
+          const transformed = pipeline.transformToolList(tools);
+          if (paginated) pipeline.setLazyManager(lazy);
+          stats.registerServer({ name: serverLabel, transport: 'stdio', tools: tools.length, status: 'connected' });
+          out = { ...message, result: { ...result, tools: transformed } };
+        } else if (req.method === 'tools/call' && req.ticket) {
+          pipeline.completeCall(req.ticket, { result });
         }
+      } else if (req?.ticket) {
+        pipeline.completeCall(req.ticket, { error: (message as { error?: unknown }).error });
       }
     }
 
-    downstreamTransport.send(outMessage).catch((err) => {
-      error(`Failed to send to agent: ${err}`);
-    });
+    sendDown(out, 'upstream message');
   };
 
-  downstreamTransport.onmessage = (message: JSONRPCMessage) => {
-    debug(`→ upstream: ${JSON.stringify(message)}`);
-    if ('method' in message && 'id' in message) {
-      tracker.trackRequest(message as { id: string | number; method: string });
+  downstream.onmessage = (message: JSONRPCMessage) => {
+    debug(() => `→ upstream: ${JSON.stringify(message)}`);
 
-      const msg = message as any;
-
-      // Intercept tools/call for lazy loading — slim tools get error + promotion
-      if (lazyManager && msg.method === 'tools/call' && msg.params) {
-        const toolName = msg.params.name as string;
-        if (lazyManager.isSlim(toolName)) {
-          lazyManager.promoteTools([toolName]);
-          const stats = lazyManager.getStats();
-          info(`Promoted tool: ${toolName} (${stats.loaded + 1} full + ${stats.slim - 1} slim)`);
-          const response = {
-            jsonrpc: '2.0' as const,
-            id: msg.id,
-            result: {
-              content: [{ type: 'text', text: 'Tool schema was not fully loaded. It has been loaded now. Please retry your call.' }],
-              isError: true,
-            },
-          };
-          downstreamTransport.send(response as JSONRPCMessage).catch((err) => {
-            error(`Failed to send promotion response: ${err}`);
-          });
-          return; // Don't forward to upstream
+    if (isJSONRPCRequest(message)) {
+      if (message.method === 'tools/call' && message.params) {
+        const params = message.params as { name?: unknown; arguments?: unknown };
+        const name = typeof params.name === 'string' ? params.name : '';
+        const args = (params.arguments ?? {}) as Record<string, unknown>;
+        const decision = pipeline.beginCall(name, args);
+        if (decision.action === 'respond') {
+          sendDown({ jsonrpc: '2.0', id: message.id, result: decision.result }, 'local tools/call result');
+          return; // answered locally, never reaches upstream
         }
+        pending.track(message.id, { method: message.method, ticket: decision.ticket });
+      } else {
+        pending.track(message.id, { method: message.method });
       }
-
-      // Intercept tools/call for caching
-      if (cache && msg.method === 'tools/call' && msg.params) {
-        const toolName = msg.params.name as string;
-        const args = (msg.params.arguments ?? {}) as Record<string, unknown>;
-
-        if (!cache.shouldCache(toolName)) {
-          cache.recordSkip();
-          debug(`Cache skip: ${toolName} (matches never-cache pattern)`);
-          // Invalidate all single-server cache entries on write
-          cache.invalidateServer('_single');
-        } else {
-          const cached = cache.get('_single', toolName, args);
-          if (cached) {
-            const age = Math.round((Date.now() - cached.cachedAt) / 1000);
-            info(`Cache hit: ${toolName} (cached ${age}s ago)`);
-            // Send cached response directly, don't forward upstream
-            const response = {
-              jsonrpc: '2.0' as const,
-              id: msg.id,
-              result: cached.result,
-            };
-            downstreamTransport.send(response as JSONRPCMessage).catch((err) => {
-              error(`Failed to send cached response: ${err}`);
-            });
-            return; // Don't forward to upstream
-          }
-          // Track for caching when response arrives
-          pendingToolCalls.set(msg.id, { toolName, args });
-        }
-      }
+    } else if (isJSONRPCNotification(message) && message.method === 'notifications/cancelled') {
+      const requestId = (message.params as { requestId?: RequestId } | undefined)?.requestId;
+      const req = requestId !== undefined ? pending.take(requestId) : undefined;
+      if (req?.ticket) pipeline.abandonCall(req.ticket);
     }
-    upstreamTransport.send(message).catch((err) => {
-      error(`Failed to send to upstream: ${err}`);
-    });
+
+    upstream.send(message).catch((err) => error(`Failed to send to upstream: ${err}`));
   };
 
-  upstreamTransport.onerror = (err: Error) => {
-    error(`Upstream error: ${err.message}`);
-  };
+  upstream.onerror = (err: Error) => error(`Upstream error: ${err.message}`);
+  downstream.onerror = (err: Error) => error(`Downstream error: ${err.message}`);
 
-  downstreamTransport.onerror = (err: Error) => {
-    error(`Downstream error: ${err.message}`);
-  };
-
-  const logShutdownAndExit = () => {
-    if (cache) {
-      const report = cache.formatShutdownReport();
-      info(report);
+  let dashboard: DashboardHandle | null = null;
+  const shutdown = installShutdown(async () => {
+    for (const req of pending.drain()) {
+      if (req.ticket) pipeline.abandonCall(req.ticket);
     }
-  };
+    if (cache) info(cache.formatShutdownReport());
+    await upstream.close().catch(() => {});
+    await dashboard?.close();
+  });
 
-  upstreamTransport.onclose = () => {
+  upstream.onclose = () => {
     debug('Upstream closed');
-    logShutdownAndExit();
-    downstreamTransport.close().catch(() => {});
-    process.exit(0);
+    shutdown(0);
   };
-
-  downstreamTransport.onclose = () => {
+  downstream.onclose = () => {
     debug('Downstream closed');
-    logShutdownAndExit();
-    upstreamTransport.close().catch(() => {});
-    process.exit(0);
+    shutdown(0);
   };
 
   info(`Spawning upstream: ${options.command} ${options.args.join(' ')}`);
   info(`Compression: ${level}`);
-  if (cache) info(`Cache: enabled (default TTL ${cache['config'].default_ttl}s)`);
-  else info(`Cache: disabled`);
-  info(`Lazy loading: ${lazyDisabled ? 'disabled' : 'auto (activates when >15 tools)'}`);
-  await upstreamTransport.start();
+  info(cache ? `Cache: enabled (default TTL ${cache.defaultTtl}s)` : 'Cache: disabled');
+  info(`Lazy loading: ${lazyDisabled ? 'disabled' : `auto (activates when >${LAZY_AUTO_THRESHOLD} tools)`}`);
+  stats.recordCacheEnabled(!!cache);
+  stats.registerServer({ name: serverLabel, transport: 'stdio', tools: 0, status: 'connected' });
+
+  try {
+    await upstream.start();
+  } catch (err) {
+    stats.registerServer({ name: serverLabel, transport: 'stdio', tools: 0, status: 'failed' });
+    throw new Error(`Cannot spawn upstream "${options.command}": ${err instanceof Error ? err.message : String(err)}`);
+  }
   debug('Upstream transport started');
 
-  await downstreamTransport.start();
+  await downstream.start();
   debug('Downstream transport started');
 
+  if (options.dashboard) dashboard = startDashboard(options.dashboard);
   info('Proxy ready — forwarding all messages');
 }
 
 // ---------------------------------------------------------------------------
-// Multi-server proxy (M3: proper MCP Server with ServerManager)
+// Multi-server proxy: an MCP Server aggregating several upstream clients
 // ---------------------------------------------------------------------------
+
+function connectedServers(manager: ServerManager) {
+  return [...manager.servers.values()].filter((s) => s.connected);
+}
 
 async function startMultiServerProxy(options: MultiServerOptions): Promise<void> {
   const { config } = options;
   const level: CompressionLevel = config.compression ?? 'standard';
 
-  // Cache setup
   const cacheDisabled = options.noCache || config.cache?.enabled === false;
-  const cacheConfig = config.cache ?? { enabled: true, default_ttl: 60, max_entries: 1000 };
-  const cache = !cacheDisabled ? new ResponseCache(cacheConfig) : null;
+  const cacheConfig = config.cache ?? { ...DEFAULT_CACHE };
+  const cache = cacheDisabled ? null : new ResponseCache(cacheConfig);
 
   const serverNames = Object.keys(config.servers);
-  const serverLabels = serverNames.map(name => {
+  const serverLabels = serverNames.map((name) => {
     const cfg = config.servers[name];
-    const type = cfg.url ? (cfg.type ?? 'http') : 'stdio';
-    return `${name} (${type})`;
+    return `${name} (${cfg.url ? (cfg.type ?? 'http') : 'stdio'})`;
   });
   info(`Starting with ${serverNames.length} servers: ${serverLabels.join(', ')}`);
 
-  const serverManager = createServerManager(config.servers);
-  await serverManager.connectAll();
+  const manager = createServerManager(config.servers);
+  await manager.connectAll();
 
-  // Determine how many servers actually connected
-  const connectedCount = [...serverManager.servers.values()].filter((s) => s.connected).length;
-  const useNamespace = connectedCount >= 2;
+  const connected = connectedServers(manager);
+  // Namespacing is fixed at startup so tool names stay stable if a server drops later.
+  const useNamespace = connected.length >= 2;
 
-  // Register servers with stats
-  for (const [name, srv] of serverManager.servers) {
-    const cfg = config.servers[name];
-    const transport = cfg?.url ? (cfg.type ?? 'http') : 'stdio';
+  for (const srv of manager.servers.values()) {
     stats.registerServer({
-      name,
-      transport,
+      name: srv.name,
+      transport: srv.connected ? srv.transport : (config.servers[srv.name]?.url ? (config.servers[srv.name].type ?? 'http') : 'stdio'),
       tools: srv.tools.length,
       status: srv.connected ? 'connected' : 'failed',
     });
   }
 
-  // Lazy loading setup
-  const lazyDisabled = options.noLazy === true || config.lazy_loading === false;
-  const maxTools = options.maxTools ?? config.max_tools_loaded ?? 8;
-  const allAlwaysLoad = new Set<string>();
+  // Lazy loading
+  const alwaysLoad = new Set<string>();
   for (const [srvName, srvCfg] of Object.entries(config.servers)) {
-    if (srvCfg.always_load) {
-      for (const toolName of srvCfg.always_load) {
-        // Store both namespaced and bare names so matching works either way
-        allAlwaysLoad.add(useNamespace ? `${srvName}__${toolName}` : toolName);
-      }
+    for (const toolName of srvCfg.always_load ?? []) {
+      alwaysLoad.add(useNamespace ? `${srvName}__${toolName}` : toolName);
     }
   }
-
-  // Count total tools to decide auto-enable
-  const totalTools = [...serverManager.servers.values()]
-    .filter(s => s.connected)
-    .reduce((sum, s) => sum + s.tools.length, 0);
-  const lazyExplicit = config.lazy_loading !== undefined || options.noLazy === true;
-  const lazyEnabled = !lazyDisabled && (lazyExplicit ? config.lazy_loading !== false : totalTools > 15);
-  const lazyManager: LazyToolManager | null = lazyEnabled
-    ? createLazyToolManager({ maxToolsLoaded: maxTools, alwaysLoad: allAlwaysLoad })
-    : null;
+  const maxTools = options.maxTools ?? config.max_tools_loaded ?? DEFAULT_MAX_TOOLS;
+  const totalTools = connected.reduce((sum, s) => sum + s.tools.length, 0);
+  const lazyEnabled =
+    options.noLazy === true ? false : config.lazy_loading ?? totalTools > LAZY_AUTO_THRESHOLD;
+  const lazy = makeLazy(lazyEnabled, maxTools, alwaysLoad);
 
   stats.recordCacheEnabled(!!cache);
-  if (cache) info(`Cache: enabled (default TTL ${cacheConfig.default_ttl}s)`);
-  else info(`Cache: disabled`);
-  info(`Lazy loading: ${lazyManager ? `enabled (max ${maxTools} full)` : `disabled${totalTools <= 15 && !lazyExplicit ? ` (${totalTools} tools ≤ 15)` : ''}` }`);
-
-  // Build the MCP server
-  const server = new Server(
-    { name: 'slim-mcp', version: '0.1.0' },
-    { capabilities: { tools: {}, resources: {}, prompts: {} } },
+  info(cache ? `Cache: enabled (default TTL ${cacheConfig.default_ttl}s)` : 'Cache: disabled');
+  info(
+    `Lazy loading: ${
+      lazy
+        ? `enabled (max ${maxTools} full)`
+        : `disabled${config.lazy_loading === undefined && !options.noLazy ? ` (${totalTools} tools ≤ ${LAZY_AUTO_THRESHOLD})` : ''}`
+    }`,
   );
+
+  const resolve = (toolName: string): ResolvedTool => {
+    if (!useNamespace) return { server: SINGLE_SERVER_KEY, tool: toolName };
+    const parsed = parseNamespacedToolName(toolName);
+    return { server: parsed.serverName || '_unknown', tool: parsed.toolName };
+  };
+  const pipeline = new ToolPipeline({ level, cache, lazy, resolve });
+
+  // Only advertise what at least one upstream supports.
+  const anyCap = (cap: 'resources' | 'prompts') => connected.some((s) => !!s.client.getServerCapabilities()?.[cap]);
+  const capabilities: ServerCapabilities = { tools: { listChanged: true } };
+  if (anyCap('resources')) capabilities.resources = {};
+  if (anyCap('prompts')) capabilities.prompts = {};
+
+  const server = new Server({ name: 'slim-mcp', version: VERSION }, { capabilities });
+
+  let initialized = false;
+  server.oninitialized = () => {
+    initialized = true;
+  };
+  const notifyToolsChanged = () => {
+    if (!initialized) return;
+    server.sendToolListChanged().catch((err) => debug(`tools/list_changed not delivered: ${err}`));
+  };
+  pipeline.onToolListChanged = notifyToolsChanged;
+
+  manager.onEvent((event) => {
+    const srv = manager.servers.get(event.server);
+    if (!srv) return;
+    cache?.invalidateServer(useNamespace ? srv.name : SINGLE_SERVER_KEY);
+    stats.registerServer({
+      name: srv.name,
+      transport: srv.transport,
+      tools: srv.tools.length,
+      status: srv.connected ? 'connected' : 'disconnected',
+    });
+    notifyToolsChanged();
+  });
 
   // tools/list
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    let tools = serverManager.getMergedTools(useNamespace);
-    info(`Ready: ${tools.length} tools from ${connectedCount} servers`);
-
-    // Apply lazy loading BEFORE compression
-    if (lazyManager) {
-      tools = lazyManager.getToolList(tools);
-      const report = lazyManager.getReport();
-      if (report) {
-        info(formatLazyReport(report));
-        stats.recordLazy(true, report.stats.loaded, report.stats.slim, report.withoutLazyTokens - report.slimTokens - report.fullTokens, report.withoutLazyTokens);
-      }
-    }
-
-    if (level === 'none') {
-      return { tools };
-    }
-
-    const before = estimateTokens(tools);
-    // Compress only full tools when lazy loading is active
-    let compressed: typeof tools;
-    if (lazyManager) {
-      compressed = tools.map((t) =>
-        lazyManager!.isSlim(t.name) ? t : compressTools([t], level)[0]
-      );
-    } else {
-      compressed = compressTools(tools, level);
-    }
-    const after = estimateTokens(compressed);
-
-    info(formatCompressionReport({ toolCount: compressed.length, beforeTokens: before, afterTokens: after }));
-    stats.recordCompression(level, before, after);
-
-    for (let i = 0; i < tools.length; i++) {
-      const origTokens = estimateTokens(tools[i]);
-      const compTokens = estimateTokens(compressed[i]);
-      if (origTokens !== compTokens) {
-        debug(`  ${compressed[i].name}: ${origTokens} → ${compTokens} tokens`);
-      }
-    }
-
-    return { tools: compressed };
+    const tools = manager.getMergedTools(useNamespace);
+    debug(`tools/list: ${tools.length} tools from ${connectedServers(manager).length} servers`);
+    return { tools: pipeline.transformToolList(tools) };
   });
 
   // tools/call
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.setRequestHandler(CallToolRequestSchema, async (request, extra): Promise<CallToolResult> => {
     const toolName = request.params.name;
     const args = (request.params.arguments ?? {}) as Record<string, unknown>;
     debug(`tools/call: ${toolName}`);
 
-    const callStart = Date.now();
-
-    // Lazy loading: intercept slim tools BEFORE cache check
-    if (lazyManager && lazyManager.isSlim(toolName)) {
-      lazyManager.promoteTools([toolName]);
-      const lazyStats = lazyManager.getStats();
-      info(`Promoted tool: ${toolName} (${lazyStats.loaded + 1} full + ${lazyStats.slim - 1} slim)`);
-      stats.recordPromotion(toolName);
-      const serverName = useNamespace ? (parseNamespacedToolName(toolName).serverName || '_unknown') : '_single';
-      stats.recordToolCall({ tool: toolName, server: serverName, cached: false, promoted: true, timestamp: new Date().toISOString(), durationMs: Date.now() - callStart });
-      return {
-        content: [{ type: 'text', text: 'Tool schema was not fully loaded. It has been loaded now. Please retry your call.' }],
-        isError: true,
-      };
-    }
-
-    // Resolve server name and original tool name for cache keying
-    let serverName: string;
-    let originalToolName: string;
-    if (useNamespace) {
-      const parsed = parseNamespacedToolName(toolName);
-      serverName = parsed.serverName || '_unknown';
-      originalToolName = parsed.toolName;
-    } else {
-      serverName = '_single';
-      originalToolName = toolName;
-    }
-
-    // Cache check
-    if (cache) {
-      if (!cache.shouldCache(originalToolName)) {
-        cache.recordSkip();
-        debug(`Cache skip: ${toolName} (matches never-cache pattern)`);
-        cache.invalidateServer(serverName);
-        stats.recordCacheInvalidation(serverName);
-      } else {
-        const cached = cache.get(serverName, originalToolName, args);
-        if (cached) {
-          const age = Math.round((Date.now() - cached.cachedAt) / 1000);
-          info(`Cache hit: ${toolName} (cached ${age}s ago)`);
-          stats.recordToolCall({ tool: toolName, server: serverName, cached: true, promoted: false, timestamp: new Date().toISOString(), durationMs: Date.now() - callStart });
-          if (cache) stats.updateCacheStats(cache.getStats(), cache.size);
-          return cached.result as { content: unknown[] };
-        }
-      }
-    }
+    const decision = pipeline.beginCall(toolName, args);
+    if (decision.action === 'respond') return decision.result;
 
     try {
-      const result = await serverManager.routeToolCall(toolName, args, useNamespace);
-      const durationMs = Date.now() - callStart;
-      // Cache successful results
-      if (cache && cache.shouldCache(originalToolName)) {
-        const r = result as any;
-        if (!r?.isError) {
-          cache.set(serverName, originalToolName, args, result);
-          debug(`Cache miss: ${toolName} → caching`);
+      const result = await manager.routeToolCall(toolName, args, useNamespace, { signal: extra.signal });
+      pipeline.completeCall(decision.ticket, { result });
+      return result;
+    } catch (err) {
+      pipeline.completeCall(decision.ticket, { error: err });
+      const msg = err instanceof Error ? err.message : String(err);
+      return { content: [{ type: 'text', text: `Error: ${msg}` }], isError: true };
+    }
+  });
+
+  // resources — list across servers in parallel, remember which server owns each URI
+  const resourceOwner = new Map<string, string>();
+
+  async function gather<T>(
+    fetch: (srv: ReturnType<typeof connectedServers>[number]) => Promise<T[]>,
+    cap: 'resources' | 'prompts',
+    what: string,
+  ): Promise<{ server: string; items: T[] }[]> {
+    const targets = connectedServers(manager).filter((s) => !!s.client.getServerCapabilities()?.[cap]);
+    const results = await Promise.allSettled(targets.map(async (s) => ({ server: s.name, items: await fetch(s) })));
+    const ok: { server: string; items: T[] }[] = [];
+    results.forEach((r, i) => {
+      if (r.status === 'fulfilled') ok.push(r.value);
+      else debug(`${what} failed on ${targets[i].name}: ${r.reason}`);
+    });
+    return ok;
+  }
+
+  if (capabilities.resources) {
+    server.setRequestHandler(ListResourcesRequestSchema, async (_req, extra) => {
+      const perServer = await gather<Resource>(
+        async (s) => (await s.client.listResources(undefined, { signal: extra.signal })).resources ?? [],
+        'resources',
+        'resources/list',
+      );
+      const resources: Resource[] = [];
+      for (const { server: owner, items } of perServer) {
+        for (const r of items) {
+          resourceOwner.set(r.uri, owner);
+          resources.push(r);
         }
       }
-      stats.recordToolCall({ tool: toolName, server: serverName, cached: false, promoted: false, timestamp: new Date().toISOString(), durationMs });
-      if (cache) stats.updateCacheStats(cache.getStats(), cache.size);
-      return result as { content: unknown[] };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      stats.recordToolCall({ tool: toolName, server: serverName, cached: false, promoted: false, timestamp: new Date().toISOString(), durationMs: Date.now() - callStart });
-      return {
-        content: [{ type: 'text', text: `Error: ${msg}` }],
-        isError: true,
-      };
-    }
-  });
+      return { resources };
+    });
 
-  // resources/list
-  server.setRequestHandler(ListResourcesRequestSchema, async () => {
-    const resources: unknown[] = [];
-    for (const srv of serverManager.servers.values()) {
-      if (!srv.connected) continue;
-      try {
-        const result = await srv.client.listResources();
-        resources.push(...(result.resources ?? []));
-      } catch {
-        // server may not support resources — skip
+    server.setRequestHandler(ListResourceTemplatesRequestSchema, async (_req, extra) => {
+      const perServer = await gather<ResourceTemplate>(
+        async (s) => (await s.client.listResourceTemplates(undefined, { signal: extra.signal })).resourceTemplates ?? [],
+        'resources',
+        'resources/templates/list',
+      );
+      return { resourceTemplates: perServer.flatMap((p) => p.items) };
+    });
+
+    server.setRequestHandler(ReadResourceRequestSchema, async (request, extra) => {
+      const uri = request.params.uri;
+      debug(`resources/read: ${uri}`);
+      const owner = manager.servers.get(resourceOwner.get(uri) ?? '');
+      if (owner?.connected) {
+        try {
+          return await owner.client.readResource({ uri }, { signal: extra.signal });
+        } catch (err) {
+          debug(`resources/read on owner ${owner.name} failed, trying others: ${err}`);
+        }
       }
-    }
-    return { resources };
-  });
+      return (await manager.routeResourceRead(uri, { signal: extra.signal })) as { contents: [] };
+    });
+  }
 
-  // resources/read
-  server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-    const uri = request.params.uri;
-    debug(`resources/read: ${uri}`);
-    try {
-      const result = await serverManager.routeResourceRead(uri);
-      return result as { contents: unknown[] };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      throw new Error(`Resource not found: ${msg}`);
-    }
-  });
+  // prompts — same ownership routing as resources
+  const promptOwner = new Map<string, string>();
 
-  // prompts/list
-  server.setRequestHandler(ListPromptsRequestSchema, async () => {
-    const prompts: unknown[] = [];
-    for (const srv of serverManager.servers.values()) {
-      if (!srv.connected) continue;
-      try {
-        const result = await srv.client.listPrompts();
-        prompts.push(...(result.prompts ?? []));
-      } catch {
-        // server may not support prompts — skip
+  if (capabilities.prompts) {
+    server.setRequestHandler(ListPromptsRequestSchema, async (_req, extra) => {
+      const perServer = await gather<Prompt>(
+        async (s) => (await s.client.listPrompts(undefined, { signal: extra.signal })).prompts ?? [],
+        'prompts',
+        'prompts/list',
+      );
+      const prompts: Prompt[] = [];
+      for (const { server: owner, items } of perServer) {
+        for (const p of items) {
+          if (!promptOwner.has(p.name)) promptOwner.set(p.name, owner);
+          prompts.push(p);
+        }
       }
-    }
-    return { prompts };
-  });
+      return { prompts };
+    });
 
-  // prompts/get — route to first server that has the prompt
-  server.setRequestHandler(GetPromptRequestSchema, async (request) => {
-    const promptName = request.params.name;
-    const promptArgs = request.params.arguments;
-    debug(`prompts/get: ${promptName}`);
-
-    for (const srv of serverManager.servers.values()) {
-      if (!srv.connected) continue;
-      try {
-        const result = await srv.client.getPrompt({ name: promptName, arguments: promptArgs });
-        return result;
-      } catch {
-        // try next server
+    server.setRequestHandler(GetPromptRequestSchema, async (request, extra) => {
+      const { name, arguments: promptArgs } = request.params;
+      debug(`prompts/get: ${name}`);
+      const ownerName = promptOwner.get(name);
+      const candidates = connectedServers(manager).filter((s) => !!s.client.getServerCapabilities()?.prompts);
+      const ordered = ownerName
+        ? [...candidates.filter((s) => s.name === ownerName), ...candidates.filter((s) => s.name !== ownerName)]
+        : candidates;
+      const errors: string[] = [];
+      for (const srv of ordered) {
+        try {
+          return await srv.client.getPrompt({ name, arguments: promptArgs }, { signal: extra.signal });
+        } catch (err) {
+          errors.push(`${srv.name}: ${err instanceof Error ? err.message : String(err)}`);
+        }
       }
-    }
-    throw new Error(`Prompt "${promptName}" not found on any connected server`);
-  });
+      throw new Error(`Prompt "${name}" not found on any connected server${errors.length ? ` (${errors.join('; ')})` : ''}`);
+    });
+  }
 
-  // Graceful shutdown
-  const shutdown = async () => {
+  let dashboard: DashboardHandle | null = null;
+  const shutdown = installShutdown(async () => {
     debug('Shutting down multi-server proxy');
-    if (cache) {
-      info(cache.formatShutdownReport());
-    }
-    await serverManager.shutdown();
-    process.exit(0);
-  };
+    if (cache) info(cache.formatShutdownReport());
+    await manager.shutdown();
+    await dashboard?.close();
+  });
 
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  server.onclose = () => shutdown(0);
 
-  // Connect agent-facing transport
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  await server.connect(new StdioServerTransport());
+  if (options.dashboard) dashboard = startDashboard(options.dashboard);
 
+  info(`Ready: ${totalTools} tools from ${connected.length} servers`);
   info('Multi-server proxy ready');
 }
 
@@ -596,19 +523,8 @@ async function startMultiServerProxy(options: MultiServerOptions): Promise<void>
 // ---------------------------------------------------------------------------
 
 export async function startProxy(options: ProxyOptions): Promise<void> {
-  // Handle legacy callers that pass { command, args, compression } without mode
-  if (!('mode' in options)) {
-    return startSingleServerProxy({
-      mode: 'single',
-      command: (options as any).command,
-      args: (options as any).args,
-      compression: (options as any).compression ?? 'standard',
-    });
-  }
-
   if (options.mode === 'single') {
     return startSingleServerProxy(options);
   }
-
   return startMultiServerProxy(options);
 }

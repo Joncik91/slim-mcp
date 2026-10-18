@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { compressTools, formatType, embedSignature, extractSharedParams, type CompressionLevel } from '../src/compress.js';
+import { compressTools, formatType, embedSignature, type CompressionLevel } from '../src/compress.js';
 
 // Helper to make a minimal valid Tool
 function makeTool(name: string, properties: Record<string, unknown> = {}, extra: Record<string, unknown> = {}): any {
@@ -108,7 +108,7 @@ describe('compressTools', () => {
       });
 
       const [result] = compressTools([tool], 'standard');
-      expect((result.inputSchema.properties as any).path).toEqual({ type: 'string', nullable: true });
+      expect((result.inputSchema.properties as any).path).toEqual({ type: ['string', 'null'] });
     });
 
     it('does not flatten anyOf with 3+ elements', () => {
@@ -410,5 +410,113 @@ describe('compressTools', () => {
       const compressed = compressTools(tools, 'extreme');
       expect(compressed[0].description).not.toContain('shared');
     });
+  });
+});
+
+describe('regressions', () => {
+  it('shared-param extraction never corrupts a longer param name (id vs user_id)', () => {
+    const tools = [
+      makeTool('srv__a', { id: { type: 'string' }, user_id: { type: 'string' } }),
+      makeTool('srv__b', { id: { type: 'string' }, user_id: { type: 'string' } }),
+      makeTool('srv__c', { id: { type: 'string' } }),
+    ];
+    const out = compressTools(tools, 'extreme');
+    // threshold for 3 tools is 2 → both id and user_id are hoisted, each intact
+    expect(out[0].description).toContain('[srv shared params: id: string, user_id: string]');
+    expect(out.map((t) => t.description).join('\n')).not.toMatch(/user_(?!id: string)/);
+    expect(out[2].description).toBe('Tool srv__c');
+  });
+
+  it('nested object params with commas/spaces are handled as single params', () => {
+    const nested = { type: 'object', properties: { a: { type: 'string' }, b: { type: 'number' } }, required: ['a'] };
+    const tools = ['x', 'y', 'z'].map((n) => makeTool(`s__${n}`, { opts: structuredClone(nested), [n]: { type: 'string' } }));
+    const out = compressTools(tools, 'maximum');
+    expect(out[0].description).toContain('[s shared: opts:{a:s! b:n?}]');
+    for (const t of out) expect(t.description!.replace(/^\[[^\]]*\] /, '')).not.toContain('opts:');
+  });
+
+  it('un-namespaced shared note has no fake "_default" prefix', () => {
+    const tools = ['a', 'b', 'c'].map((n) => makeTool(n, { path: { type: 'string' } }));
+    expect(compressTools(tools, 'maximum')[0].description).toMatch(/^\[shared: path:s\]/);
+  });
+
+  it('does not double the period when the description already ends with one', () => {
+    const [t] = compressTools([makeTool('t', { x: { type: 'string' } }, { description: 'Does a thing.' })], 'extreme');
+    expect(t.description).toBe('Does a thing. Params: x: string');
+  });
+
+  it('aggressive dedup keeps enums and nested structure, strips only descriptions', () => {
+    const fmt = { type: 'string', enum: ['json', 'csv'], description: 'Output format' };
+    const out = compressTools([makeTool('a', { fmt: { ...fmt } }), makeTool('b', { fmt: { ...fmt } })], 'aggressive');
+    expect((out[1].inputSchema.properties as any).fmt).toEqual({ type: 'string', enum: ['json', 'csv'] });
+  });
+
+  it('aggressive dedup does not merge params with different enums', () => {
+    const out = compressTools([
+      makeTool('a', { mode: { type: 'string', enum: ['x'], description: 'Selects variant' } }),
+      makeTool('b', { mode: { type: 'string', enum: ['y'], description: 'Selects variant' } }),
+    ], 'aggressive');
+    expect((out[1].inputSchema.properties as any).mode.description).toBe('Selects variant');
+  });
+
+  it('aggressive dedup is scoped per server namespace', () => {
+    const p = { type: 'string', description: 'Repository path' };
+    const out = compressTools([makeTool('gh__a', { p: { ...p } }), makeTool('fs__b', { p: { ...p } })], 'aggressive');
+    expect((out[1].inputSchema.properties as any).p.description).toBe('Repository path');
+  });
+
+  it('nullable enum keeps null as an allowed value', () => {
+    const [t] = compressTools([makeTool('t', { s: { anyOf: [{ type: 'string', enum: ['a'] }, { type: 'null' }] } })], 'standard');
+    expect((t.inputSchema.properties as any).s).toEqual({ type: ['string', 'null'], enum: ['a', null] });
+  });
+
+  it('single-variant anyOf keeps the outer description', () => {
+    const [t] = compressTools([makeTool('t', { s: { description: 'outer', anyOf: [{ type: 'string', description: 'inner' }] } })], 'standard');
+    expect((t.inputSchema.properties as any).s).toEqual({ type: 'string', description: 'outer' });
+  });
+
+  it('preserves annotations, title and _meta at every level', () => {
+    const tool = makeTool('t', { x: { type: 'string' } }, { toolExtra: { title: 'T', annotations: { readOnlyHint: true }, _meta: { k: 1 } } });
+    for (const level of ['standard', 'aggressive', 'extreme', 'maximum'] as const) {
+      const [out] = compressTools([tool], level);
+      expect(out.annotations, level).toEqual({ readOnlyHint: true });
+      expect(out.title, level).toBe('T');
+      expect(out._meta, level).toEqual({ k: 1 });
+    }
+  });
+
+  it('never mutates the input', () => {
+    const tool = makeTool('t', { x: { type: 'string', description: 'X value', title: 'X' } }, { schemaExtra: { additionalProperties: false } });
+    const snapshot = structuredClone(tool);
+    for (const level of ['standard', 'aggressive', 'extreme', 'maximum'] as const) compressTools([tool, tool, tool], level);
+    expect(tool).toEqual(snapshot);
+  });
+
+  it('truncates at a word boundary when there is no sentence boundary', () => {
+    const [t] = compressTools([makeTool('t', {}, { description: 'word '.repeat(60) })], 'standard');
+    expect(t.description!.length).toBeLessThanOrEqual(200);
+    expect(t.description!.endsWith('word')).toBe(true);
+  });
+});
+
+describe('formatType edge cases', () => {
+  it('renders JSON Schema type arrays', () => {
+    expect(formatType({ type: ['string', 'null'] }, true)).toBe('s|null');
+    expect(formatType({ type: ['integer', 'string'] }, false)).toBe('integer|string');
+  });
+
+  it('resolves local $refs against the root schema', () => {
+    const root = { $defs: { Point: { type: 'object', properties: { x: { type: 'number' } }, required: ['x'] } } };
+    expect(formatType({ $ref: '#/$defs/Point' }, true, root)).toBe('{x:n!}');
+  });
+
+  it('survives self-referential $refs', () => {
+    const root = { $defs: { Node: { $ref: '#/$defs/Node' } } };
+    expect(formatType({ $ref: '#/$defs/Node' }, true, root)).toBe('obj');
+  });
+
+  it('renders const and parenthesises union arrays', () => {
+    expect(formatType({ const: 'x' }, true)).toBe('"x"');
+    expect(formatType({ type: 'array', items: { anyOf: [{ type: 'string' }, { type: 'number' }] } }, true)).toBe('(s|n)[]');
   });
 });

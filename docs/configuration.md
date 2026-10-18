@@ -216,19 +216,38 @@ slim-mcp validates the config file on startup. If any rule is violated, it exits
 | `url` must be non-empty | `url` is present but is an empty string |
 | `type` requires `url` | `type` is set on a stdio server (one with `command`) |
 | `headers` requires `url` | `headers` is set on a stdio server (one with `command`) |
-| `compression` must be valid | Value is not one of `"none"`, `"standard"`, `"aggressive"` |
+| Server names | Contain `__` (reserved as the namespace separator) |
+| `url` must be http(s) | Not a parseable `http:`/`https:` URL (after env expansion) |
+| String fields | `args`, `always_load`, `never_cache` not arrays of strings; `env`/`headers` values not strings |
+| Numbers | `cache_ttl`, `default_ttl`, `tool_ttls`/`server_ttls` values negative or non-numeric; `max_entries`, `max_tools_loaded` not non-negative integers; `dashboard.port` outside 1-65535 |
+| Booleans | `lazy_loading`, `cache.enabled`, `dashboard.enabled` not booleans |
+| `never_cache` | Entry is not a valid regular expression |
+| `compression` must be valid | Value is not one of `"none"`, `"standard"`, `"aggressive"`, `"extreme"`, `"maximum"` |
 | `cache` must be an object | `cache` is present but is not an object |
+
+Unknown keys (typos such as `"compresion"`) are not errors but print a warning on startup.
+
+---
+
+## Dashboard
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | `boolean` | `true` (multi-server) | Serve the live stats dashboard. |
+| `port` | `number` | `7333` | TCP port. |
+| `host` | `string` | `"127.0.0.1"` | Bind address. Loopback binds reject requests whose `Host` header is not loopback (DNS-rebinding guard). Binding elsewhere prints a warning: the dashboard has no authentication. |
 
 ---
 
 ## Environment Variable Expansion
 
-String values in `env` (stdio servers) and `headers` (HTTP/SSE servers) support `${VAR_NAME}` placeholder syntax. At startup, each placeholder is replaced with the corresponding value from the process environment.
+`command`, `args`, `env` values, `url` and `headers` values support `${VAR_NAME}` and `${VAR_NAME:-default}` placeholders. At startup, each placeholder is replaced from the process environment.
 
 **Behavior:**
 
-- `${VAR_NAME}` is replaced with the value of the environment variable `VAR_NAME`.
-- If `VAR_NAME` is not set in the environment, the placeholder `${VAR_NAME}` is **left as-is** (no error, no empty string).
+- `${VAR_NAME}` is replaced with the value of `VAR_NAME`.
+- `${VAR_NAME:-default}` uses `default` when `VAR_NAME` is unset or empty.
+- If `VAR_NAME` is unset and there is no default, the placeholder is **left as-is** and a warning names the variable.
 - Expansion happens once at config load time, not on each request.
 
 **Example:**
@@ -237,15 +256,17 @@ String values in `env` (stdio servers) and `headers` (HTTP/SSE servers) support 
 {
   "env": {
     "DATABASE_URL": "${DATABASE_URL}",
-    "API_KEY": "${MY_SERVICE_KEY}"
+    "API_KEY": "${MY_SERVICE_KEY}",
+    "LOG_LEVEL": "${LOG_LEVEL:-info}"
   }
 }
 ```
 
-If `DATABASE_URL=postgres://localhost/mydb` is set but `MY_SERVICE_KEY` is not, the resolved values are:
+If `DATABASE_URL=postgres://localhost/mydb` is set but `MY_SERVICE_KEY` and `LOG_LEVEL` are not, the resolved values are:
 
 - `DATABASE_URL` = `"postgres://localhost/mydb"`
-- `API_KEY` = `"${MY_SERVICE_KEY}"` (unchanged)
+- `API_KEY` = `"${MY_SERVICE_KEY}"` (unchanged, with a warning)
+- `LOG_LEVEL` = `"info"`
 
 ---
 
@@ -258,7 +279,10 @@ When determining the cache TTL for a specific tool call, slim-mcp checks the fol
 | 1 (highest) | `cache.tool_ttls` with namespaced name | `"filesystem__read_file"` |
 | 2 | `cache.tool_ttls` with bare name | `"read_file"` |
 | 3 | `cache.server_ttls` for the server, or the server's `cache_ttl` | `"filesystem"` |
-| 4 (lowest) | `cache.default_ttl` | -- |
+| 4 | Built-in TTL for well-known tools (see below) | `"git_status"` → 15s |
+| 5 (lowest) | `cache.default_ttl` | -- |
+
+A TTL of `0` disables caching for that tool or server.
 
 If no match is found at any level, the global `default_ttl` of **60 seconds** is used.
 
@@ -300,21 +324,21 @@ The resolved TTLs are:
 
 ## Built-in Caching Behaviors
 
-### Never-cache patterns
+### Never-cache rules
 
-The following regex pattern is applied case-insensitively to every tool name. Any tool whose name matches is **never cached**, regardless of any TTL configuration:
+A tool is **never cached** (and every call to it invalidates that server's cached reads) when, in order:
 
-```
-^(create|write|update|delete|remove|set|put|post|patch|send|submit|commit|push|exec|run|invoke|apply|deploy)
-```
+1. Its name matches a user `never_cache` pattern (case-insensitive regex), or
+2. The upstream tool declares `annotations.readOnlyHint: false` or `annotations.destructiveHint: true` (a `readOnlyHint: true` annotation makes it cacheable instead), or
+3. Its name contains a mutating verb as a whole word -- `create`, `write`, `update`, `delete`, `remove`, `set`, `put`, `post`, `patch`, `send`, `submit`, `commit`, `push`, `exec`, `run`, `invoke`, `apply`, `deploy`, `click`, and more -- unless the name *starts* with a read verb (`get`, `list`, `read`, `search`, `find`, `describe`, `fetch`, `show`, `view`, `query`, ...).
 
-This covers tools that perform mutations or side effects. The pattern matches the **start** of the tool name, so `write_file`, `delete_record`, `send_email`, `run_query`, etc. are all excluded from caching.
+Names are split on `_`, `-`, `.` and camelCase, so `write_file`, `issue_create`, `createIssue` and `git_commit` are excluded, while `calculate_total`, `postgres_schema` and `get_commit` stay cacheable.
 
-The `never_cache` array in `CacheConfig` lets you add additional patterns on top of these built-in ones.
+A cached read that was in flight when a write hit the same server is discarded rather than stored.
 
 ### Always-cache defaults
 
-The following tools have built-in default TTLs that apply even without explicit configuration:
+The following tools have built-in default TTLs. They apply when no `tool_ttls` or `server_ttls` entry matches, and win over `default_ttl`:
 
 | Tool name | Default TTL |
 |-----------|-------------|

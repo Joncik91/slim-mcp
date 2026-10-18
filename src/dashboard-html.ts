@@ -32,12 +32,14 @@ export function getDashboardHTML(): string {
   .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
   .status-dot.ok { background: #3fb950; }
   .status-dot.fail { background: #f85149; }
+  .status-dot.warn { background: #d29922; }
   .calls-table { width: 100%; border-collapse: collapse; font-size: 12px; }
   .calls-table th { text-align: left; color: #8b949e; font-weight: normal; padding: 4px 8px; border-bottom: 1px solid #21262d; }
   .calls-table td { padding: 4px 8px; border-bottom: 1px solid #21262d; }
   .hit { color: #3fb950; }
   .miss { color: #d29922; }
   .promoted { color: #bc8cff; }
+  .err { color: #f85149; }
   .time { color: #8b949e; }
   .calls-container { max-height: 300px; overflow-y: auto; }
   .no-data { color: #484f58; font-style: italic; font-size: 13px; }
@@ -100,7 +102,6 @@ export function getDashboardHTML(): string {
 </div>
 
 <script>
-function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.textContent; }
 function fmt(n) { return n.toLocaleString('en-US'); }
 function fmtUptime(s) {
   if (s < 60) return s + 's';
@@ -114,14 +115,22 @@ function timeStr(iso) {
 
 function setText(id, text) { document.getElementById(id).textContent = text; }
 
+var startedAtMs = null;
+function tickUptime() {
+  if (startedAtMs !== null) setText('uptime', 'uptime: ' + fmtUptime(Math.max(0, Math.round((Date.now() - startedAtMs) / 1000))));
+}
+setInterval(tickUptime, 1000);
+
 function update(data) {
-  setText('uptime', 'uptime: ' + fmtUptime(data.uptime));
+  var started = Date.parse(data.startedAt);
+  startedAtMs = isNaN(started) ? Date.now() - data.uptime * 1000 : started;
+  tickUptime();
   setText('tokens-saved', fmt(data.totalSavedTokens));
   setText('cache-rate', data.cache.hitRate + '%');
   const rateEl = document.getElementById('cache-rate');
   rateEl.className = 'value ' + (data.cache.hitRate >= 50 ? 'green' : data.cache.hitRate > 0 ? 'yellow' : '');
 
-  const totalTools = data.servers.reduce(function(s, srv) { return s + srv.tools; }, 0);
+  const totalTools = data.servers.reduce(function(s, srv) { return s + (srv.status === 'connected' ? srv.tools : 0); }, 0);
   setText('tool-count', String(totalTools));
   setText('call-count', fmt(data.toolCalls.total));
 
@@ -132,9 +141,10 @@ function update(data) {
     data.servers.forEach(function(s) {
       const li = document.createElement('li');
       const dot = document.createElement('span');
-      dot.className = 'status-dot ' + (s.status === 'connected' ? 'ok' : 'fail');
+      dot.className = 'status-dot ' + (s.status === 'connected' ? 'ok' : s.status === 'disconnected' ? 'warn' : 'fail');
       li.appendChild(dot);
-      li.appendChild(document.createTextNode(s.name + ' (' + s.transport + ') \\u2014 ' + s.tools + ' tools'));
+      var detail = s.status === 'connected' ? s.tools + ' tools' : s.status;
+      li.appendChild(document.createTextNode(s.name + ' (' + s.transport + ') \\u2014 ' + detail));
       sl.appendChild(li);
     });
   } else {
@@ -179,7 +189,8 @@ function update(data) {
       var tdTool = document.createElement('td'); tdTool.textContent = c.tool;
       var tdStatus = document.createElement('td');
       var statusSpan = document.createElement('span');
-      if (c.promoted) { statusSpan.className = 'promoted'; statusSpan.textContent = 'PROMOTED'; }
+      if (c.error) { statusSpan.className = 'err'; statusSpan.textContent = 'ERROR'; }
+      else if (c.promoted) { statusSpan.className = 'promoted'; statusSpan.textContent = 'PROMOTED'; }
       else if (c.cached) { statusSpan.className = 'hit'; statusSpan.textContent = 'HIT'; }
       else { statusSpan.className = 'miss'; statusSpan.textContent = 'MISS'; }
       tdStatus.appendChild(statusSpan);

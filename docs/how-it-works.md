@@ -4,20 +4,22 @@ Deep dive into slim-mcp's architecture and internals for developers who want to 
 
 ## Module Overview
 
-slim-mcp has 10 source files totaling ~2,060 lines:
-
-| Module | Lines | Purpose |
-|--------|-------|---------|
-| `src/proxy.ts` | 586 | Core proxy logic -- single-server (JSON-RPC passthrough) and multi-server (MCP SDK server) modes |
-| `src/compress.ts` | 293 | Schema compression engine -- 3 stages (structural cleanup, description trimming, param dedup) |
-| `src/config.ts` | 245 | Config file parsing, validation, env var expansion |
-| `src/server-manager.ts` | 235 | Multi-server lifecycle -- connect, list tools, namespace, route calls, shutdown |
-| `src/index.ts` | 226 | CLI entry point -- arg parsing, mode selection |
-| `src/lazy.ts` | 186 | Lazy loading -- slim indexes, tool promotion, budget management |
-| `src/cache.ts` | 177 | Response cache -- TTL, LRU eviction, write invalidation, stats |
-| `src/transport/http.ts` | 72 | HTTP/SSE transport factory -- typed creation and auto-detect |
-| `src/tokens.ts` | 24 | Token estimation -- `JSON.stringify(tool).length / 4` heuristic |
-| `src/logger.ts` | 19 | Stderr logging with `[slim-mcp]` prefix, verbose toggle |
+| Module | Purpose |
+|--------|---------|
+| `src/proxy.ts` | Both proxy modes -- single-server (JSON-RPC passthrough) and multi-server (MCP SDK server) -- plus shutdown coordination |
+| `src/pipeline.ts` | Shared `tools/list` transform (lazy + batch compression + stats) and `tools/call` interception (promotion, cache) used by both modes |
+| `src/compress.ts` | Schema compression engine -- structural cleanup, description trimming, param dedup, signature embedding |
+| `src/config.ts` | Config file parsing, strict validation, env var expansion |
+| `src/server-manager.ts` | Multi-server lifecycle -- connect, paginated tool listing, namespace, route calls, follow upstream changes, shutdown |
+| `src/cli.ts` | CLI argument parsing and dashboard policy |
+| `src/index.ts` | Entry point -- mode selection |
+| `src/lazy.ts` | Lazy loading -- slim indexes, tool promotion, budget management |
+| `src/cache.ts` | Response cache -- TTL, LRU eviction, write invalidation with in-flight race protection, stats |
+| `src/stats.ts`, `src/dashboard.ts`, `src/dashboard-html.ts` | Stats collector and the live dashboard (HTTP + SSE) |
+| `src/transport/http.ts` | HTTP/SSE transport factory -- typed creation and auto-detect |
+| `src/tokens.ts` | Token estimation -- `JSON.stringify(tool).length / 4` heuristic |
+| `src/logger.ts` | Stderr logging with `[slim-mcp]` prefix, verbose toggle |
+| `src/version.ts` | Package version, read once from `package.json` |
 
 ---
 
@@ -34,40 +36,24 @@ Activated when running `slim-mcp -- command args...`. This mode sits between the
 - **Downstream**: `StdioServerTransport` -- reads JSON-RPC from the agent's stdin, writes to the agent's stdout.
 - **Upstream**: `StdioClientTransport` -- spawns the MCP server as a child process, communicates via its stdin/stdout. stderr is inherited (passed through to the terminal).
 
-**Message flow -- upstream to agent (responses):**
-
-1. Check if the response ID matches a tracked `tools/list` request (via `RequestTracker`).
-2. If it is a `tools/list` response:
-   - Initialize the lazy manager on the first response if not disabled and the server has >15 tools.
-   - Apply lazy loading (split tools into full and slim).
-   - Apply compression to full tools only (slim tools pass through unchanged).
-   - Forward the modified response to the agent.
-3. If it is a `tools/call` response and there is a pending cache entry for that request ID:
-   - Cache the result (only if the result has no `isError` flag).
-   - Delete the pending entry.
-   - Forward the response unchanged.
-4. All other messages: forward unchanged.
+The upstream child inherits the full parent environment (`PATH`, proxy settings, npm config), same as multi-server mode.
 
 **Message flow -- agent to upstream (requests):**
 
-1. Track all requests with an `id` and `method` field in the `RequestTracker`.
-2. If `tools/call` and the tool is slim:
-   - Do NOT forward to upstream.
-   - Add the tool to the promoted set.
-   - Return an error response directly: "Tool schema was not fully loaded. It has been loaded now. Please retry your call."
-3. If `tools/call` and the tool matches a never-cache pattern:
-   - Record a skip in cache stats.
-   - Invalidate all cache entries for the `_single` server.
-   - Forward to upstream.
-4. If `tools/call` and there is a cache hit:
-   - Do NOT forward to upstream.
-   - Return the cached result directly to the agent.
-5. If `tools/call` and cache miss:
-   - Store a pending entry mapping the request ID to `{ toolName, args }`.
-   - Forward to upstream.
-6. All other messages: forward unchanged.
+1. Every request is recorded in `PendingRequests` (`id → { method, ticket? }`) until its response arrives.
+2. `tools/call` goes through `ToolPipeline.beginCall()` (see [Call pipeline](#call-pipeline)). If the pipeline answers locally (cache hit, or a slim tool called with arguments that do not match its schema) the response is sent straight back and nothing is forwarded.
+3. `notifications/cancelled` drops the pending entry for that request.
+4. Everything else is forwarded unchanged.
 
-**The RequestTracker** exists because JSON-RPC responses contain only the request `id`, not the method name. The tracker maintains a `Set<string | number>` of request IDs corresponding to `tools/list` calls. When a response arrives, the tracker identifies whether it is a `tools/list` response. The ID is consumed (deleted) after use to prevent memory leaks.
+**Message flow -- upstream to agent (responses):**
+
+1. Responses (results *and* JSON-RPC errors) are matched to their pending entry by `id`; the entry is removed either way, so nothing leaks.
+2. `initialize` result: `capabilities.tools.listChanged` is set to `true` (unless `--no-lazy`) so the agent re-fetches tools after a promotion.
+3. `tools/list` result: on the first non-paginated response with >15 tools, lazy loading activates. The tool list is passed through `ToolPipeline.transformToolList()`. Paginated responses are compressed but not lazy-loaded.
+4. `tools/call` result or error: `ToolPipeline.completeCall()` records stats and caches successful, cacheable results.
+5. Everything else (notifications, server→client requests like `roots/list` or sampling) is forwarded unchanged.
+
+**Shutdown:** the proxy exits on the first of: agent closes stdin (the MCP stdio shutdown signal), `SIGINT`/`SIGTERM`/`SIGHUP`, or the upstream exiting. The upstream gets stdin EOF, then `SIGTERM`, then `SIGKILL`.
 
 ### Multi-Server Mode (MCP SDK Server)
 
@@ -75,14 +61,7 @@ Activated when running with `--config`, `--url`, or when a `.slim-mcp.json` file
 
 **MCP Server setup:**
 
-```typescript
-const server = new Server(
-  { name: 'slim-mcp', version: '0.1.0' },
-  { capabilities: { tools: {}, resources: {}, prompts: {} } },
-);
-```
-
-The server declares support for tools, resources, and prompts. It then registers handlers for each.
+The server always declares `tools: { listChanged: true }`. It declares `resources` and `prompts` only if at least one connected upstream does, and registers those handlers only then.
 
 **`tools/list` handler:**
 
@@ -91,24 +70,25 @@ The server declares support for tools, resources, and prompts. It then registers
 3. Compress full tools only (slim tools pass through). Skip compression entirely if level is `none`.
 4. Return the tool list.
 
-**`tools/call` handler:**
+**`tools/call` handler:** `ToolPipeline.beginCall()` decides (see [Call pipeline](#call-pipeline)); forwarded calls are routed via `serverManager.routeToolCall()` with the agent's cancellation signal attached. Upstream errors become `{ isError: true }` results.
 
-1. If tool is slim: promote it and return error asking the agent to retry.
-2. Resolve server name and original tool name (parse namespace if in multi-server mode).
-3. Check cache:
-   - If tool matches never-cache patterns: record skip, invalidate that server's cache entries.
-   - If cache hit: return cached result immediately.
-4. Route call to the correct upstream server via `serverManager.routeToolCall()`.
-5. Cache successful results (no `isError` flag).
-6. Return the result. On error, return `{ isError: true }` with the error message.
+**`resources/list` / `resources/templates/list`:** Queried on all resource-capable servers in parallel; the proxy remembers which server listed each URI.
 
-**`resources/list` handler:** Iterates all connected servers, calls `listResources()` on each, aggregates results. Servers that do not support resources are silently skipped.
+**`resources/read`:** Goes to the server that listed the URI; falls back to trying each resource-capable server.
 
-**`resources/read` handler:** Delegates to `serverManager.routeResourceRead(uri)`, which tries each connected server in order until one succeeds.
+**`prompts/list` / `prompts/get`:** Same ownership routing as resources. If no server has the prompt, the error lists each server's failure.
 
-**`prompts/list` handler:** Same aggregation pattern as resources -- collects from all connected servers.
+**Upstream changes:** When an upstream sends `notifications/tools/list_changed`, the proxy re-fetches that server's tools, invalidates its cache, and notifies the agent. When an upstream process dies, it is marked `disconnected` (visible in the dashboard), its tools disappear from `tools/list`, and the agent is notified.
 
-**`prompts/get` handler:** Tries each connected server in order until one returns the requested prompt.
+**Shutdown:** same triggers as single-server mode; all upstream clients are closed (5s cap each).
+
+### Call pipeline
+
+`ToolPipeline.beginCall(name, args)` in `src/pipeline.ts`:
+
+1. **Slim tool?** Promote it and notify the agent (`tools/list_changed`). If `args` validate against the tool's full `inputSchema` (Ajv, via the MCP SDK), continue -- the call goes through in one round trip. Otherwise answer with an error that contains the full schema and asks for a retry.
+2. **Cacheable?** (`shouldCache`, see [Write Detection](#write-detection-and-invalidation)). If not: count a skip and invalidate that server's cache. If yes: return a cache hit locally, or remember the server's cache *generation* and forward.
+3. `completeCall()` stores the result only if it succeeded and no write invalidated the server while the call was in flight.
 
 ---
 
@@ -122,13 +102,13 @@ Connects to all configured servers in parallel via `Promise.allSettled`. Each co
 
 1. Creates an MCP `Client` instance.
 2. Establishes the transport:
-   - **Stdio**: `StdioClientTransport` with `command`, `args`, and merged `env` (process env + config env). stderr is piped, and the last 20 lines are retained for error diagnostics.
+   - **Stdio**: `StdioClientTransport` with `command`, `args`, and merged `env` (process env + config env). stderr is piped, and the last 20 lines are retained for error diagnostics (and logged with `--verbose`).
    - **HTTP with explicit type**: Creates transport via `createTypedTransport()`.
-   - **HTTP with auto-detect**: Calls `connectWithAutoDetect()` which tries Streamable HTTP first, then falls back to SSE.
-3. Calls `client.listTools()` to fetch the tool catalog.
-4. Stores the `ManagedServer` record: `{ name, client, tools, connected: true }`.
+   - **HTTP with auto-detect**: Calls `connectWithAutoDetect()` which tries Streamable HTTP first, then falls back to SSE on a fresh `Client`.
+3. Fetches every page of `tools/list` (servers without the `tools` capability contribute none).
+4. Stores the `ManagedServer` record: `{ name, client, tools, connected: true, transport }` and subscribes to `tools/list_changed` and to transport close.
 
-Each connection has a **30-second timeout** (`withTimeout` wrapper using `Promise.race`). Failed connections are stored as disconnected placeholders (`connected: false`, empty tools array) -- this is not fatal to the proxy.
+Each connection has a **30-second timeout**. On failure or timeout the client is closed (killing any spawned child) and a disconnected placeholder is stored -- this is not fatal to the proxy.
 
 ### Tool Merging (`getMergedTools`)
 
@@ -171,7 +151,7 @@ Applied recursively to the tool's `inputSchema` and all nested properties:
 - **Removes** `title` fields from property schemas.
 - **Removes** descriptions that merely restate a default value (patterns: "Default: X", "Defaults to X").
 - **Flattens** single-element `anyOf`/`oneOf` wrappers. If an `anyOf` contains one item, the wrapper is removed and the inner schema is merged into the parent. Common in Pydantic/Zod-generated schemas.
-- **Converts** nullable patterns: `anyOf: [{type: "X"}, {type: "null"}]` becomes `{type: "X", nullable: true}`.
+- **Converts** nullable patterns: `anyOf: [{type: "X"}, {type: "null"}]` becomes `{type: ["X", "null"]}` (valid JSON Schema; `null` is added to any `enum`).
 
 The `cleanProperty()` function recurses into nested `properties` objects and `items` (array schemas), so deeply nested schemas are cleaned too.
 
@@ -241,7 +221,7 @@ Called on every `tools/list` response. Receives the full tool array.
 2. Build the "full" set (capped at `maxToolsLoaded`, default 8):
    - Add all `alwaysLoad` tools (from config `always_load` per server).
    - Add all previously `promoted` tools.
-   - Fill remaining budget with tools matching `HIGH_PRIORITY_PATTERNS`: `/^(search|list|read|get|find|describe|info)/i`. These are common read operations that agents tend to call first.
+   - Fill remaining budget with tools matching `HIGH_PRIORITY_PATTERNS`: `/^(search|list|read|get|find|describe|info)/i`, tested against the bare name (after any `server__` prefix). These are common read operations that agents tend to call first.
 3. Build the result list preserving original order:
    - Tools in the full set: returned as-is.
    - All others: converted to slim format.
@@ -256,23 +236,21 @@ Called on every `tools/list` response. Receives the full tool array.
 }
 ```
 
-This is a valid MCP tool definition. The agent knows the tool exists and what it does (from the description), but cannot construct correct arguments because the `inputSchema` has no `properties` or `required` fields.
+`title`, `annotations` (e.g. `destructiveHint`) and other tool-level metadata are kept; only `inputSchema` and `outputSchema` are dropped. The agent knows the tool exists and what it does, but not the exact arguments.
 
 ### Promotion Flow
 
-1. Agent attempts to call a slim tool with guessed arguments.
-2. The proxy intercepts the call before it reaches the cache or upstream server.
-3. `promoteTools([toolName])` adds the tool name to the `promoted` set.
-4. The proxy returns an error response:
+1. Agent calls a slim tool with arguments guessed from the description.
+2. The proxy promotes the tool and sends `notifications/tools/list_changed`.
+3. If the arguments validate against the full schema, the call is forwarded normally -- no extra round trip.
+4. Otherwise the proxy returns an error that embeds the full definition:
    ```json
    {
-     "content": [{ "type": "text", "text": "Tool schema was not fully loaded. It has been loaded now. Please retry your call." }],
+     "content": [{ "type": "text", "text": "Tool schema was not fully loaded (arguments rejected: ...). It has been loaded now. Please retry your call with arguments matching this definition:\n{...}" }],
      "isError": true
    }
    ```
-5. The agent, seeing the error, typically requests a fresh `tools/list`.
-6. On the next `tools/list`, the promoted tool appears with its full schema (it is now in the `promoted` set).
-7. The agent retries with correct arguments.
+5. The agent retries with correct arguments. The next `tools/list` also shows the full schema.
 
 ### Budget Overflow
 
@@ -290,11 +268,7 @@ Defined in `src/cache.ts`. The `ResponseCache` class caches upstream `tools/call
 serverName:toolName:stableHash(args)
 ```
 
-**`stableHash(args)`**: Produces a deterministic hash regardless of key order.
-
-1. `stableStringify(obj)`: Recursively serializes the object with sorted keys. Arrays preserve order. Primitives use `JSON.stringify`. The result is a canonical JSON string where `{a:1, b:2}` and `{b:2, a:1}` produce the same output.
-2. **djb2 hash**: The canonical string is hashed using the djb2 algorithm (seed 5381, shift-and-add), producing a 32-bit unsigned integer.
-3. Convert to base-36 string for compact representation.
+**`stableHash(args)`**: SHA-256 (base64url) of a canonical JSON string with sorted keys and `undefined` members dropped, so `{a:1, b:2}` and `{b:2, a:1}` share a key. Server and tool names are JSON-quoted in the key so names containing `:` cannot collide.
 
 ### Read Path (`get`)
 
@@ -307,9 +281,10 @@ The LRU move is implemented by deleting and re-inserting: JavaScript `Map` prese
 
 ### Write Path (`set`)
 
-1. If at `max_entries` capacity and the key is new: evict the oldest entry (first key in the Map via `keys().next().value`), increment `evictions`.
-2. Resolve TTL for this server+tool combination (see TTL resolution below).
-3. Store the entry with `cachedAt: Date.now()`, the resolved TTL, hit count 0, and `responseSize` (JSON string length of the result).
+1. If the caller passed a cache generation and the server was invalidated since, store nothing (a write raced this read).
+2. Resolve TTL (see below). TTL `0` or `max_entries: 0` means store nothing.
+3. Evict the oldest entries while at capacity.
+4. Store the entry with `cachedAt: Date.now()`, the resolved TTL, hit count 0, and `responseSize` (JSON string length of the result).
 
 ### TTL Resolution
 
@@ -318,28 +293,24 @@ The `resolveTTL(serverName, toolName)` method checks in order:
 1. `tool_ttls[serverName__toolName]` -- namespaced tool-specific TTL.
 2. `tool_ttls[toolName]` -- bare tool-specific TTL.
 3. `server_ttls[serverName]` -- server-level TTL.
-4. `default_ttl` -- global default (60 seconds if not configured).
+4. Built-in TTL for well-known tools (`ALWAYS_CACHE_DEFAULTS`, e.g. `git_status: 15`, `read_file: 30`).
+5. `default_ttl` -- global default (60 seconds if not configured).
 
 First match wins. This allows fine-grained control: you can set a 5-minute TTL for `describe` tools while keeping a 15-second TTL for `git_status`.
 
 ### Write Detection and Invalidation
 
-`shouldCache(toolName)` checks the tool name against two pattern lists:
+`shouldCache(toolName, annotations?)` decides, first match wins:
 
-**Built-in `NEVER_CACHE_PATTERNS`** (5 regex groups):
-- Mutating: `create`, `write`, `delete`, `remove`, `update`, `edit`, `modify`, `set`, `put`, `post`, `patch`, `push`, `move`, `rename`, `copy`
-- Destructive: `drop`, `truncate`, `reset`, `clear`, `purge`, `destroy`, `kill`, `stop`, `start`, `restart`
-- Communication: `send`, `notify`, `publish`, `emit`, `dispatch`, `broadcast`, `email`, `message`, `slack`
-- Version control: `commit`, `merge`, `rebase`, `checkout`, `branch`, `tag`, `stash`, `cherry`
-- Execution: `run`, `exec`, `execute`, `invoke`, `call`, `trigger`, `apply`, `deploy`
-
-**User `never_cache`** patterns from config, compiled to case-insensitive regexes.
+1. **User `never_cache`** patterns (case-insensitive regexes) → never cached.
+2. **MCP annotations** from the upstream tool definition: `readOnlyHint: true` → cacheable; `readOnlyHint: false` or `destructiveHint: true` → never cached.
+3. **Name heuristic.** The name is split into word tokens (snake_case, kebab-case, dotted, camelCase). If the first token is a read verb (`get`, `list`, `read`, `search`, `find`, `describe`, `fetch`, `show`, `view`, `query`, ...) it is cacheable. Otherwise, any mutating-verb token (`create`, `write`, `delete`, `update`, `set`, `post`, `send`, `commit`, `run`, `exec`, `click`, ...) makes it never cached. Whole tokens are compared, so `calculate` is not `call` and `postgres_schema` is not `post`, while `issue_create` and `git_commit` are caught.
 
 When a write operation is detected, `invalidateServer(serverName)` removes ALL cache entries whose key starts with `serverName:`. This is a conservative strategy: a write to one tool invalidates all cached reads from that server, since the write may have changed the data those reads would return.
 
 ### Built-in Cache Defaults
 
-The `ALWAYS_CACHE_DEFAULTS` object provides suggested TTLs for common tool patterns (e.g., `read_file: 30`, `git_status: 15`, `describe: 120`). These are reference values but do not affect runtime behavior -- actual TTLs come from the config's `tool_ttls`, `server_ttls`, or `default_ttl`.
+`ALWAYS_CACHE_DEFAULTS` gives TTLs for well-known tools (e.g., `read_file: 30`, `git_status: 15`, `describe: 120`). They apply when no `tool_ttls` or `server_ttls` entry matches, and take precedence over `default_ttl`.
 
 ### Shutdown Report
 
@@ -417,9 +388,11 @@ Return tool list to agent
 tools/call request from agent
          |
          v
-Is tool slim? --yes--> Promote tool + return error ("retry")
-         |
-         no
+Is tool slim? --yes--> Promote + notify list_changed
+         |                         |
+         no            args match full schema? --no--> Return error with full schema ("retry")
+         |                         |
+         |<-----------------------yes
          |
          v
 Should cache? --no (write op)--> Invalidate server cache
@@ -434,7 +407,7 @@ Cache hit? --yes--> Return cached result    Route to upstream
 Route to upstream server
          |
          v
-Cache successful response
+Cache successful response (unless a write invalidated the server meanwhile)
          |
          v
 Return result to agent
@@ -461,18 +434,19 @@ Defined in `src/config.ts`. Handles config file discovery, parsing, validation, 
 ```typescript
 interface McpSlimConfig {
   servers: Record<string, ServerConfig>;  // required, at least 1 entry
-  compression: 'none' | 'standard' | 'aggressive';  // default: 'standard'
+  compression: 'none' | 'standard' | 'aggressive' | 'extreme' | 'maximum';  // default: 'standard'
   cache?: CacheConfig;
   max_tools_loaded?: number;
   lazy_loading?: boolean;
+  dashboard?: { enabled?: boolean; port?: number; host?: string };
 }
 ```
 
-Each server must have exactly one of `command` (stdio) or `url` (HTTP/SSE). Having both or neither is a validation error.
+Each server must have exactly one of `command` (stdio) or `url` (HTTP/SSE). Having both or neither is a validation error. Server names must not contain `__`. Every field is type-checked (wrong types, negative numbers, invalid regexes in `never_cache`, non-http URLs are errors). Unknown keys produce a warning, so typos are visible.
 
 ### Environment Variable Expansion
 
-`expandEnvVars()` replaces `${VAR_NAME}` patterns in `env` and `headers` values with the corresponding `process.env` value. If the variable is not set, the original `${VAR_NAME}` string is preserved (not replaced with empty string).
+`${VAR}` and `${VAR:-default}` are expanded in `command`, `args`, `env`, `url` and `headers`. An unset variable with no default is left verbatim and a warning names it.
 
 ### Server-Level Cache TTL
 
@@ -482,14 +456,15 @@ If a server config has `cache_ttl`, it is automatically promoted into `cache.ser
 
 ## CLI Entry Point
 
-Defined in `src/index.ts`. Parses command-line arguments and selects the proxy mode.
+Defined in `src/cli.ts` (parsing) and `src/index.ts` (mode selection). Everything after `--` belongs to the upstream command and is never interpreted, so `slim-mcp -- server --help` passes `--help` to the server. In the legacy positional form, everything after the command belongs to it too. Unknown options are an error.
 
 ### Mode Selection Priority
 
-1. **`--url` present**: Build a synthetic single-server config and start in multi-server mode. Cannot be combined with `--`.
-2. **`--` present**: Everything after `--` is the upstream command. Start in single-server mode.
-3. **`--config` present OR no positional args**: Try to load a config file (explicit path or auto-discover). Start in multi-server mode. If no config is found and no command, print usage and exit.
-4. **Positional args present**: Treat first arg as command, rest as args. Start in single-server mode (legacy mode).
+1. **`--url` present**: Build a synthetic single-server config and start in multi-server mode. Cannot be combined with an upstream command.
+2. **Upstream command present** (after `--`, or legacy positional): single-server mode. Cannot be combined with `--config`.
+3. **Otherwise**: load the config file (explicit `--config` or auto-discovered) and start in multi-server mode. If none is found, print usage and exit 1.
+
+The dashboard is on by default in multi-server mode, off in single-server mode, forced on by `--dashboard-port`, and off with `--no-dashboard`.
 
 ### Flag Handling
 
@@ -525,9 +500,10 @@ Compressed 45 tools: 12500 -> 8200 tokens (34% reduction)
 
 Defined in `src/logger.ts`. All output goes to stderr (stdout is reserved for JSON-RPC protocol messages).
 
-Three levels:
+Four levels:
 
 - **`info(msg)`**: Always logged. Prefix: `[slim-mcp]`.
+- **`warn(msg)`**: Always logged. Prefix: `[slim-mcp] WARN:`.
 - **`error(msg)`**: Always logged. Prefix: `[slim-mcp] ERROR:`.
 - **`debug(msg)`**: Only logged when verbose mode is enabled via `setVerbose(true)`. Same prefix as info. Used for JSON-RPC message dumps and per-tool compression details.
 
@@ -535,20 +511,21 @@ Three levels:
 
 ## Testing
 
-173 tests across 10 test files. All unit tests with no network dependencies. Integration tests spawn real MCP servers (filesystem server) as child processes.
+Unit tests (`npm test`) have no network dependencies except `integration.test.ts`, which spawns the real filesystem server via `npx`. End-to-end tests (`npm run test:e2e`) drive the built proxy as a child process against `test/e2e/mock-server.ts`.
 
 | Test file | What it covers |
 |-----------|---------------|
-| `compress.test.ts` | All 3 compression stages: structural cleanup, description trimming, param dedup |
-| `config.test.ts` | Config parsing, validation, defaults, env var expansion |
-| `config-http.test.ts` | HTTP/SSE server config validation (url, type, headers) |
-| `cache.test.ts` | Cache get/set, TTL expiry, LRU eviction, write invalidation, stats, stable hashing |
-| `lazy.test.ts` | Slim format, promotion, budget, high-priority patterns, stats reporting |
-| `tokens.test.ts` | Token estimation, compression report formatting |
-| `transport-http.test.ts` | Transport factory creation for http/sse types |
-| `proxy.test.ts` | RequestTracker, maybeCompressResponse, proxy exports and option types |
+| `compress.test.ts` | All compression stages, signature embedding, shared-param hoisting, `formatType`, input immutability |
+| `config.test.ts`, `config-http.test.ts`, `config-validation.test.ts` | Config parsing, strict validation, defaults, env var expansion |
+| `cache.test.ts` | Get/set, TTL, LRU, built-in TTLs, token-based classification, annotations, write/read race |
+| `lazy.test.ts` | Slim format, promotion, budget, namespaced priority patterns, stats |
+| `pipeline.test.ts` | Promotion with schema validation, batch compression under lazy loading, cache integration |
+| `cli.test.ts` | Argument parsing, `--` passthrough, dashboard policy |
+| `proxy.test.ts` | Pending-request tracking, exports and option types |
 | `server-manager.test.ts` | Server lifecycle, namespacing, tool merging |
-| `integration.test.ts` | End-to-end: compression with real server, multi-server aggregation and routing |
+| `tokens.test.ts`, `transport-http.test.ts` | Token estimation, transport factory |
+| `integration.test.ts` | Real filesystem server: compression, multi-server aggregation and routing |
+| `e2e/*.test.ts` | Single/multi-server, caching, lazy loading, error handling, lifecycle (stdin EOF exit, child reaping, upstream crash, upstream `list_changed`) |
 
 Run tests:
 
