@@ -16,20 +16,20 @@ describe('ToolPipeline lazy promotion', () => {
     const p = new ToolPipeline({ level: 'standard', cache: null, lazy, resolve });
     let changed = 0;
     p.onToolListChanged = () => changed++;
-    p.transformToolList([tool('do_thing', { n: { type: 'number' } }, ['n'])]);
+    p.transformToolList([tool('get_thing', { n: { type: 'number' } }, ['n'])]);
     return { p, changed: () => changed };
   }
 
   it('forwards a slim call whose args already match the full schema', () => {
     const { p, changed } = setup();
-    const d = p.beginCall('do_thing', { n: 1 });
+    const d = p.beginCall('get_thing', { n: 1 });
     expect(d.action).toBe('forward');
     expect(changed()).toBe(1);
   });
 
   it('rejects invalid args with the full schema and a retry hint', () => {
     const { p } = setup();
-    const d = p.beginCall('do_thing', { n: 'nope' });
+    const d = p.beginCall('get_thing', { n: 'nope' });
     expect(d.action).toBe('respond');
     if (d.action !== 'respond') return;
     expect(d.result.isError).toBe(true);
@@ -40,8 +40,8 @@ describe('ToolPipeline lazy promotion', () => {
 
   it('promotes only once', () => {
     const { p, changed } = setup();
-    p.beginCall('do_thing', {});
-    p.beginCall('do_thing', { n: 2 });
+    p.beginCall('get_thing', {});
+    p.beginCall('get_thing', { n: 2 });
     expect(changed()).toBe(1);
   });
 
@@ -100,5 +100,53 @@ describe('ToolPipeline caching', () => {
     const d = p.beginCall('run_report', {});
     if (d.action === 'forward') p.completeCall(d.ticket, { result: { content: [] } });
     expect(p.beginCall('run_report', {}).action).toBe('respond');
+  });
+});
+
+describe('review regressions', () => {
+  const cacheCfg = { enabled: true, default_ttl: 60, max_entries: 10 };
+
+  it('keeps annotations from earlier pages of a paginated tools/list', () => {
+    const cache = new ResponseCache(cacheCfg);
+    const p = new ToolPipeline({ level: 'none', cache, lazy: null, resolve });
+    p.transformToolList([{ ...tool('archive_thing', {}), annotations: { destructiveHint: true } }], { paginated: true });
+    p.transformToolList([tool('read_x', {})], { append: true, paginated: true });
+    const d = p.beginCall('archive_thing', {});
+    if (d.action === 'forward') p.completeCall(d.ticket, { result: { content: [] } });
+    expect(p.beginCall('archive_thing', {}).action).toBe('forward');
+  });
+
+  it('a read that started during a write is not cached after the write finishes', () => {
+    const cache = new ResponseCache(cacheCfg);
+    const p = new ToolPipeline({ level: 'none', cache, lazy: null, resolve });
+    const write = p.beginCall('write_file', {});
+    const read = p.beginCall('read_file', {}); // starts after the write began
+    if (read.action === 'forward') p.completeCall(read.ticket, { result: { content: [{ type: 'text', text: 'OLD' }] } });
+    if (write.action === 'forward') p.completeCall(write.ticket, { result: { content: [] } });
+    expect(p.beginCall('read_file', {}).action).toBe('forward');
+  });
+
+  function slimPipeline(t: Tool) {
+    const lazy = createLazyToolManager({ maxToolsLoaded: 0, alwaysLoad: new Set() });
+    const p = new ToolPipeline({ level: 'standard', cache: null, lazy, resolve });
+    p.transformToolList([t]);
+    return p;
+  }
+
+  it('never runs a side-effecting slim tool before the agent has seen its schema', () => {
+    const p = slimPipeline(tool('purge_files', { pattern: { type: 'string', default: '*' } }));
+    expect(p.beginCall('purge_files', { pattern: '*.tmp' }).action).toBe('respond');
+  });
+
+  it('bounces misnamed arguments that a permissive schema would accept', () => {
+    const p = slimPipeline(tool('search_files', { pattern: { type: 'string', default: '*' } }));
+    const d = p.beginCall('search_files', { glob: '*.tmp' });
+    expect(d.action).toBe('respond');
+    if (d.action === 'respond') expect((d.result.content[0] as { text: string }).text).toContain('unknown argument(s): glob');
+  });
+
+  it('respects a destructiveHint on a read-sounding slim tool', () => {
+    const p = slimPipeline({ ...tool('get_and_reset', {}), annotations: { destructiveHint: true } });
+    expect(p.beginCall('get_and_reset', {}).action).toBe('respond');
   });
 });

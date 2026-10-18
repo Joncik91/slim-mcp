@@ -6,7 +6,7 @@ import type { JsonSchemaType, JsonSchemaValidator } from '@modelcontextprotocol/
 import { compressTools, type CompressionLevel } from './compress.js';
 import { estimateTokens, formatCompressionReport } from './tokens.js';
 import { formatLazyReport, type LazyToolManager } from './lazy.js';
-import type { ResponseCache } from './cache.js';
+import { looksReadOnly, type ResponseCache } from './cache.js';
 import { info, debug } from './logger.js';
 import { stats } from './stats.js';
 
@@ -36,7 +36,16 @@ export interface CallTicket {
   readonly startedAt: number;
   /** Cache generation at request time; undefined when the result must not be cached. */
   readonly cacheGeneration: number | undefined;
+  /** Side-effecting call: the server's cache is invalidated again when it finishes. */
+  readonly invalidates: boolean;
   readonly promoted: boolean;
+}
+
+export interface ToolListOptions {
+  /** This is a later page of a paginated tools/list: merge, don't replace. */
+  append?: boolean;
+  /** Part of a paginated listing: lazy loading is skipped (it needs the whole set). */
+  paginated?: boolean;
 }
 
 /** Outcome of slim-tool interception. `listChanged` tells the caller to notify the client. */
@@ -86,12 +95,18 @@ export class ToolPipeline {
   // tools/list
   // -------------------------------------------------------------------------
 
-  transformToolList(tools: Tool[]): Tool[] {
-    this.fullTools = new Map(tools.map((t) => [t.name, t]));
-    this.validators.clear();
+  transformToolList(tools: Tool[], options: ToolListOptions = {}): Tool[] {
+    if (!options.append) {
+      this.fullTools = new Map();
+      this.validators.clear();
+    }
+    for (const t of tools) {
+      this.fullTools.set(t.name, t);
+      this.validators.delete(t.name);
+    }
 
     let listed = tools;
-    const lazy = this.lazy;
+    const lazy = options.paginated ? null : this.lazy;
     if (lazy) {
       listed = lazy.getToolList(tools);
       const report = lazy.getReport();
@@ -155,10 +170,12 @@ export class ToolPipeline {
     if (promotion.decision) return promotion.decision;
 
     let cacheGeneration: number | undefined;
+    let invalidates = false;
     const cache = this.cache;
     if (cache) {
       const hints = this.fullTools.get(toolName)?.annotations;
-      if (!cache.shouldCache(resolved.tool, hints)) {
+      if (!cache.shouldCache(resolved.tool, hints, resolved.server)) {
+        invalidates = true;
         cache.recordSkip();
         cache.invalidateServer(resolved.server);
         stats.recordCacheInvalidation(resolved.server);
@@ -177,12 +194,13 @@ export class ToolPipeline {
 
     return {
       action: 'forward',
-      ticket: { toolName, args, resolved, startedAt, cacheGeneration, promoted: promotion.promoted },
+      ticket: { toolName, args, resolved, startedAt, cacheGeneration, invalidates, promoted: promotion.promoted },
     };
   }
 
   /** Record the upstream outcome of a forwarded call; caches successful cacheable results. */
   completeCall(ticket: CallTicket, outcome: { result: unknown } | { error: unknown }): void {
+    this.settleWrite(ticket);
     const failed = 'error' in outcome || isErrorResult(outcome.result);
     if (!failed && this.cache && ticket.cacheGeneration !== undefined && 'result' in outcome) {
       const { server, tool } = ticket.resolved;
@@ -201,7 +219,16 @@ export class ToolPipeline {
 
   /** Drop a forwarded call that will never complete (cancelled, transport closed). */
   abandonCall(ticket: CallTicket): void {
+    this.settleWrite(ticket);
     this.record(ticket.toolName, ticket.resolved, ticket.startedAt, { cached: false, promoted: ticket.promoted, error: true });
+  }
+
+  /**
+   * A write invalidates its server when it starts (so cached reads aren't served during it)
+   * and again when it ends, so reads that overlapped it can't store pre-write data.
+   */
+  private settleWrite(ticket: CallTicket): void {
+    if (ticket.invalidates && this.cache) this.cache.invalidateServer(ticket.resolved.server);
   }
 
   private record(
@@ -221,9 +248,10 @@ export class ToolPipeline {
   }
 
   /**
-   * Slim (schema-less) tools are promoted on first use. If the agent's arguments already
-   * satisfy the full schema the call proceeds; otherwise the agent gets the full schema
-   * back and is asked to retry.
+   * Slim (schema-less) tools are promoted on first use. The call proceeds in the same round
+   * trip only when that is safe: the tool looks read-only, every argument name is declared
+   * in the schema, and the arguments validate. Otherwise the agent gets the full schema back
+   * and is asked to retry.
    */
   private interceptSlimTool(
     toolName: string,
@@ -241,7 +269,9 @@ export class ToolPipeline {
     this.onToolListChanged?.();
 
     const full = this.fullTools.get(toolName) ?? lazy.getFullTool(toolName);
-    const check = full ? this.validate(toolName, full, args) : { valid: false as const, message: 'schema unavailable' };
+    const check = full
+      ? this.checkFirstCall(toolName, full, args, resolved)
+      : { valid: false as const, message: 'schema unavailable' };
     if (check.valid) {
       debug(`Promoted ${toolName}: arguments match the full schema — forwarding`);
       return { promoted: true };
@@ -249,6 +279,26 @@ export class ToolPipeline {
 
     this.record(toolName, resolved, startedAt, { cached: false, promoted: true, error: false });
     return { promoted: true, decision: { action: 'respond', result: this.promotionResult(toolName, full, check.message) } };
+  }
+
+  private checkFirstCall(
+    toolName: string,
+    tool: Tool,
+    args: Record<string, unknown>,
+    resolved: ResolvedTool,
+  ): { valid: true } | { valid: false; message: string } {
+    // Never run a side-effecting tool whose schema the agent has not seen.
+    if (!looksReadOnly(resolved.tool, tool.annotations)) {
+      return { valid: false, message: 'tool may have side effects; confirm arguments against the schema' };
+    }
+    // Schemas usually allow extra keys, so a misnamed argument would validate and be ignored.
+    const props = (tool.inputSchema as { properties?: unknown }).properties;
+    const declared = props && typeof props === 'object' ? Object.keys(props) : [];
+    const unknown = Object.keys(args).filter((k) => !declared.includes(k));
+    if (unknown.length > 0) {
+      return { valid: false, message: `unknown argument(s): ${unknown.join(', ')}` };
+    }
+    return this.validate(toolName, tool, args);
   }
 
   private validate(

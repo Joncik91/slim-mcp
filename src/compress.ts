@@ -399,7 +399,8 @@ function compressToSignatures(tools: Tool[], level: 'extreme' | 'maximum'): Tool
     for (const i of indices) {
       for (const p of new Set(sigs[i].params)) counts.set(p, (counts.get(p) ?? 0) + 1);
     }
-    const threshold = Math.min(3, Math.ceil(indices.length * 0.6));
+    // "Shared" means most of the server's tools take it (at least 3 and at least 60%).
+    const threshold = Math.max(3, Math.ceil(indices.length * 0.6));
     const shared = [...counts].filter(([, c]) => c >= threshold).map(([p]) => p);
     if (shared.length === 0) continue;
 

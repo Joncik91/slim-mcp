@@ -33,9 +33,15 @@ export interface ParsedArgs {
 
 export class UsageError extends Error {}
 
+const KNOWN_FLAGS = new Set([
+  '--', '--help', '-h', '--version', '--verbose', '-v', '--no-cache', '--no-lazy', '--no-dashboard',
+  '--dashboard-port', '--max-tools', '--url', '--header', '--transport', '--compression', '--config',
+]);
+
 /**
  * Parse CLI arguments. Everything after `--` belongs to the upstream command and is
- * never interpreted (so `-- server --help` passes --help through).
+ * never interpreted (so `-- server --help` passes --help through). In the legacy form
+ * without `--`, slim-mcp flags are recognised anywhere and other arguments go upstream.
  */
 export function parseArgs(argv: string[]): ParsedArgs {
   const args = argv.slice(2);
@@ -69,8 +75,9 @@ export function parseArgs(argv: string[]): ParsedArgs {
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
 
-    // Legacy mode: once the upstream command starts, the rest is its argv.
-    if (positional.length > 0) {
+    // Legacy form (no --): slim-mcp's own flags are recognised anywhere, as they always
+    // were; everything else after the command belongs to the upstream.
+    if (positional.length > 0 && !KNOWN_FLAGS.has(arg)) {
       positional.push(arg);
       continue;
     }

@@ -90,6 +90,11 @@ function isPlainObject(v: unknown): v is Obj {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
+/** Explicit `null` means "not set", as it did before validation was strict. */
+function withoutNulls(obj: Obj): Obj {
+  return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== null));
+}
+
 class ConfigValidator {
   constructor(readonly source: string) {}
 
@@ -138,8 +143,9 @@ class ConfigValidator {
   }
 }
 
-function parseServer(name: string, raw: unknown, v: ConfigValidator): ServerConfig {
-  if (!isPlainObject(raw)) v.fail(`server "${name}" must be an object`);
+function parseServer(name: string, input: unknown, v: ConfigValidator): ServerConfig {
+  if (!isPlainObject(input)) v.fail(`server "${name}" must be an object`);
+  const raw = withoutNulls(input);
   if (name.length === 0) v.fail('server names must be non-empty');
   if (name.includes('__')) v.fail(`server "${name}": name must not contain "__" (used as the namespace separator)`);
   v.warnUnknown(raw, SERVER_KEYS, `server "${name}"`);
@@ -188,8 +194,9 @@ function parseServer(name: string, raw: unknown, v: ConfigValidator): ServerConf
   return server;
 }
 
-function parseCache(raw: unknown, v: ConfigValidator): CacheConfig {
-  if (!isPlainObject(raw)) v.fail('"cache" must be an object');
+function parseCache(input: unknown, v: ConfigValidator): CacheConfig {
+  if (!isPlainObject(input)) v.fail('"cache" must be an object');
+  const raw = withoutNulls(input);
   v.warnUnknown(raw, CACHE_KEYS, '"cache"');
   const cache: CacheConfig = {
     enabled: raw.enabled === undefined ? true : v.boolean(raw.enabled, '"cache.enabled"'),
@@ -211,8 +218,9 @@ function parseCache(raw: unknown, v: ConfigValidator): CacheConfig {
   return cache;
 }
 
-function parseDashboard(raw: unknown, v: ConfigValidator): DashboardConfig {
-  if (!isPlainObject(raw)) v.fail('"dashboard" must be an object');
+function parseDashboard(input: unknown, v: ConfigValidator): DashboardConfig {
+  if (!isPlainObject(input)) v.fail('"dashboard" must be an object');
+  const raw = withoutNulls(input);
   v.warnUnknown(raw, DASHBOARD_KEYS, '"dashboard"');
   const port = raw.port === undefined ? DEFAULT_DASHBOARD_PORT : v.nonNegInt(raw.port, '"dashboard.port"');
   if (port < 1 || port > 65535) v.fail('"dashboard.port" must be between 1 and 65535');
@@ -226,9 +234,10 @@ function parseDashboard(raw: unknown, v: ConfigValidator): DashboardConfig {
   };
 }
 
-export function parseConfig(raw: unknown, sourcePath: string): McpSlimConfig {
+export function parseConfig(input: unknown, sourcePath: string): McpSlimConfig {
   const v: ConfigValidator = new ConfigValidator(sourcePath);
-  if (!isPlainObject(raw)) v.fail('must be a JSON object');
+  if (!isPlainObject(input)) v.fail('must be a JSON object');
+  const raw = withoutNulls(input);
   v.warnUnknown(raw, TOP_LEVEL_KEYS, 'top level');
 
   if (raw.servers === undefined) v.fail('missing required field "servers"');

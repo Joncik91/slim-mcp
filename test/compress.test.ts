@@ -421,10 +421,19 @@ describe('regressions', () => {
       makeTool('srv__c', { id: { type: 'string' } }),
     ];
     const out = compressTools(tools, 'extreme');
-    // threshold for 3 tools is 2 → both id and user_id are hoisted, each intact
-    expect(out[0].description).toContain('[srv shared params: id: string, user_id: string]');
-    expect(out.map((t) => t.description).join('\n')).not.toMatch(/user_(?!id: string)/);
+    // id is in all 3 tools → hoisted; user_id is in only 2 → stays in each signature, intact
+    expect(out[0].description).toMatch(/^\[srv shared params: id: string\] Tool srv__a\. Params: user_id: string$/);
+    expect(out[1].description).toBe('Tool srv__b. Params: user_id: string');
     expect(out[2].description).toBe('Tool srv__c');
+  });
+
+  it('does not call a param shared when only a minority of tools take it', () => {
+    const tools = Array.from({ length: 10 }, (_, i) =>
+      makeTool(`s__t${i}`, i < 3 ? { force: { type: 'boolean' } } : { x: { type: 'string' } }),
+    );
+    const out = compressTools(tools, 'maximum');
+    expect(out[0].description).not.toContain('force:b]');
+    expect(out[0].description).toContain('P: force:b');
   });
 
   it('nested object params with commas/spaces are handled as single params', () => {

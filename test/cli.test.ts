@@ -13,10 +13,12 @@ describe('parseArgs', () => {
     expect(p.args).toEqual(['--help', '--version', '-v']);
   });
 
-  it('legacy positional form: everything after the command belongs to it', () => {
-    const p = parseArgs(argv('node', 'server.js', '--port', '3'));
+  it('legacy positional form: slim flags anywhere are consumed, the rest goes upstream', () => {
+    const p = parseArgs(argv('node', 'server.js', '--port', '3', '--compression', 'aggressive', '--no-cache'));
     expect(p.command).toBe('node');
     expect(p.args).toEqual(['server.js', '--port', '3']);
+    expect(p.compression).toBe('aggressive');
+    expect(p.noCache).toBe(true);
   });
 
   it('rejects unknown options instead of treating them as a command', () => {

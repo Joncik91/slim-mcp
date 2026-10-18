@@ -49,11 +49,11 @@ The upstream child inherits the full parent environment (`PATH`, proxy settings,
 
 1. Responses (results *and* JSON-RPC errors) are matched to their pending entry by `id`; the entry is removed either way, so nothing leaks.
 2. `initialize` result: `capabilities.tools.listChanged` is set to `true` (unless `--no-lazy`) so the agent re-fetches tools after a promotion.
-3. `tools/list` result: on the first non-paginated response with >15 tools, lazy loading activates. The tool list is passed through `ToolPipeline.transformToolList()`. Paginated responses are compressed but not lazy-loaded.
+3. `tools/list` result: on the first non-paginated response with >15 tools, lazy loading activates. The tool list is passed through `ToolPipeline.transformToolList()`. Once the upstream paginates (`nextCursor` in a response or `cursor` in a request), lazy loading is off for the session; pages are compressed and their tool metadata accumulated.
 4. `tools/call` result or error: `ToolPipeline.completeCall()` records stats and caches successful, cacheable results.
 5. Everything else (notifications, server→client requests like `roots/list` or sampling) is forwarded unchanged.
 
-**Shutdown:** the proxy exits on the first of: agent closes stdin (the MCP stdio shutdown signal), `SIGINT`/`SIGTERM`/`SIGHUP`, or the upstream exiting. The upstream gets stdin EOF, then `SIGTERM`, then `SIGKILL`.
+**Shutdown:** the proxy exits on the first of: agent closes stdin (the MCP stdio shutdown signal), `SIGINT`/`SIGTERM`/`SIGHUP` (exit 0), or the upstream exiting unexpectedly (exit 1). The upstream gets stdin EOF, then `SIGTERM`, then `SIGKILL`.
 
 ### Multi-Server Mode (MCP SDK Server)
 
@@ -86,7 +86,7 @@ The server always declares `tools: { listChanged: true }`. It declares `resource
 
 `ToolPipeline.beginCall(name, args)` in `src/pipeline.ts`:
 
-1. **Slim tool?** Promote it and notify the agent (`tools/list_changed`). If `args` validate against the tool's full `inputSchema` (Ajv, via the MCP SDK), continue -- the call goes through in one round trip. Otherwise answer with an error that contains the full schema and asks for a retry.
+1. **Slim tool?** Promote it and notify the agent (`tools/list_changed`). The call continues in the same round trip only if the tool looks read-only, every argument name is declared in its schema, and the arguments validate against the full `inputSchema` (Ajv, via the MCP SDK). Otherwise answer with an error that contains the full schema and asks for a retry. A side-effecting tool never runs before the agent has seen its schema.
 2. **Cacheable?** (`shouldCache`, see [Write Detection](#write-detection-and-invalidation)). If not: count a skip and invalidate that server's cache. If yes: return a cache hit locally, or remember the server's cache *generation* and forward.
 3. `completeCall()` stores the result only if it succeeded and no write invalidated the server while the call was in flight.
 
@@ -242,7 +242,7 @@ Called on every `tools/list` response. Receives the full tool array.
 
 1. Agent calls a slim tool with arguments guessed from the description.
 2. The proxy promotes the tool and sends `notifications/tools/list_changed`.
-3. If the arguments validate against the full schema, the call is forwarded normally -- no extra round trip.
+3. If the tool looks read-only, uses only declared argument names, and the arguments validate against the full schema, the call is forwarded normally -- no extra round trip.
 4. Otherwise the proxy returns an error that embeds the full definition:
    ```json
    {
@@ -300,11 +300,9 @@ First match wins. This allows fine-grained control: you can set a 5-minute TTL f
 
 ### Write Detection and Invalidation
 
-`shouldCache(toolName, annotations?)` decides, first match wins:
+`shouldCache(toolName, annotations?, server?)` caches only on positive evidence of a read, first match wins: user `never_cache` → no; `readOnlyHint: false` / `destructiveHint: true` → no; explicit `tool_ttls` entry → yes; `readOnlyHint: true` → yes; built-in known read tool → yes; `looksReadOnly()` name heuristic → yes only for a leading read verb (first or second word) with no mutating word or conjunction; otherwise no. See [configuration](configuration.md#which-tools-are-cached) for the full rule.
 
-1. **User `never_cache`** patterns (case-insensitive regexes) → never cached.
-2. **MCP annotations** from the upstream tool definition: `readOnlyHint: true` → cacheable; `readOnlyHint: false` or `destructiveHint: true` → never cached.
-3. **Name heuristic.** The name is split into word tokens (snake_case, kebab-case, dotted, camelCase). If the first token is a read verb (`get`, `list`, `read`, `search`, `find`, `describe`, `fetch`, `show`, `view`, `query`, ...) it is cacheable. Otherwise, any mutating-verb token (`create`, `write`, `delete`, `update`, `set`, `post`, `send`, `commit`, `run`, `exec`, `click`, ...) makes it never cached. Whole tokens are compared, so `calculate` is not `call` and `postgres_schema` is not `post`, while `issue_create` and `git_commit` are caught.
+A side-effecting call invalidates its server's cache when it starts **and** when it finishes, so a read that overlapped the write cannot store pre-write data.
 
 When a write operation is detected, `invalidateServer(serverName)` removes ALL cache entries whose key starts with `serverName:`. This is a conservative strategy: a write to one tool invalidates all cached reads from that server, since the write may have changed the data those reads would return.
 
@@ -442,7 +440,7 @@ interface McpSlimConfig {
 }
 ```
 
-Each server must have exactly one of `command` (stdio) or `url` (HTTP/SSE). Having both or neither is a validation error. Server names must not contain `__`. Every field is type-checked (wrong types, negative numbers, invalid regexes in `never_cache`, non-http URLs are errors). Unknown keys produce a warning, so typos are visible.
+Each server must have exactly one of `command` (stdio) or `url` (HTTP/SSE). Having both or neither is a validation error. Server names must not contain `__`. Explicit `null` means "not set". Every other field is type-checked (wrong types, negative numbers, invalid regexes in `never_cache`, non-http URLs are errors). Unknown keys produce a warning, so typos are visible.
 
 ### Environment Variable Expansion
 
@@ -456,7 +454,7 @@ If a server config has `cache_ttl`, it is automatically promoted into `cache.ser
 
 ## CLI Entry Point
 
-Defined in `src/cli.ts` (parsing) and `src/index.ts` (mode selection). Everything after `--` belongs to the upstream command and is never interpreted, so `slim-mcp -- server --help` passes `--help` to the server. In the legacy positional form, everything after the command belongs to it too. Unknown options are an error.
+Defined in `src/cli.ts` (parsing) and `src/index.ts` (mode selection). Everything after `--` belongs to the upstream command and is never interpreted, so `slim-mcp -- server --help` passes `--help` to the server. In the legacy positional form (no `--`), slim-mcp's own flags are recognised anywhere and everything else after the command goes to it. Unknown options before the command are an error.
 
 ### Mode Selection Priority
 

@@ -29,28 +29,71 @@ export interface CacheHints {
   openWorldHint?: boolean;
 }
 
-/** Verbs that signal a side effect. Matched against whole name tokens, not prefixes. */
-const MUTATING_VERBS = [
-  'create', 'write', 'delete', 'remove', 'update', 'edit', 'modify', 'set', 'put', 'post', 'patch',
-  'push', 'move', 'rename', 'copy', 'upload', 'insert', 'upsert', 'add', 'save', 'submit',
-  'drop', 'truncate', 'reset', 'clear', 'purge', 'destroy', 'kill', 'stop', 'start', 'restart',
-  'send', 'notify', 'publish', 'emit', 'dispatch', 'broadcast', 'email', 'message', 'reply', 'comment',
-  'commit', 'merge', 'rebase', 'checkout', 'branch', 'tag', 'stash', 'cherry', 'revert', 'pull',
-  'run', 'exec', 'execute', 'invoke', 'call', 'trigger', 'apply', 'deploy', 'install', 'click', 'navigate', 'type',
+/** Words that always signal a side effect, wherever they appear in the name. */
+const STRONG_MUTATING = [
+  'create', 'write', 'delete', 'remove', 'update', 'edit', 'modify', 'set', 'put', 'patch', 'push',
+  'move', 'rename', 'copy', 'upload', 'insert', 'upsert', 'add', 'save', 'submit', 'replace', 'fill',
+  'drop', 'truncate', 'reset', 'clear', 'purge', 'destroy', 'kill', 'restart', 'close', 'cancel',
+  'send', 'notify', 'publish', 'emit', 'dispatch', 'broadcast', 'reply', 'invite', 'kick', 'ban',
+  'merge', 'rebase', 'checkout', 'stash', 'revert', 'exec', 'execute', 'invoke', 'trigger', 'apply',
+  'deploy', 'install', 'uninstall', 'click', 'navigate', 'setup', 'assign', 'unassign', 'approve',
+  'reject', 'enable', 'disable', 'grant', 'revoke', 'transfer', 'rollback', 'migrate', 'unarchive',
+  'mark', 'toggle', 'increment', 'decrement', 'dismiss', 'pay', 'refund', 'sign', 'book', 'order',
 ];
 
-/** Verbs that, as the leading token, mark the tool as a read even if a later token is a mutating word. */
+/** Conjunctions mark compound tools ("read_and_mark", "get_or_create"): never treated as reads. */
+const CONJUNCTIONS = new Set(['and', 'or', 'then']);
+
+/**
+ * Words that signal a side effect but are also common nouns ("get_commit", "list_branch",
+ * "get_run_status"). A leading read verb overrides them.
+ */
+const WEAK_MUTATING = [
+  'post', 'email', 'message', 'comment', 'commit', 'branch', 'tag', 'cherry', 'pull', 'call', 'type',
+  'run', 'start', 'stop', 'archive', 'schedule', 'import', 'lock', 'unlock', 'sync', 'pin', 'star',
+];
+
+/** Prefixes caught even in run-together lowercase names ("createissue", "executesql"). */
+const MUTATING_PREFIXES = [
+  'create', 'update', 'delete', 'remove', 'execute', 'insert', 'upsert', 'write', 'upload', 'rename',
+  'submit', 'destroy', 'truncate', 'purge', 'deploy', 'install', 'publish', 'restart', 'start', 'stop',
+];
+
+/** Leading verbs that mark a read when no strong mutating word follows. */
 const READ_VERBS = new Set([
   'get', 'list', 'read', 'search', 'find', 'describe', 'info', 'fetch', 'show', 'view', 'query',
   'count', 'lookup', 'stat', 'diff', 'inspect', 'browse',
 ]);
 
-const MUTATING_SET = new Set(MUTATING_VERBS);
+const STRONG_SET = new Set(STRONG_MUTATING);
+const WEAK_SET = new Set(WEAK_MUTATING);
 
-/** Kept for API compatibility: one regex per verb, anchored to a token boundary. */
+/** Kept for API compatibility: matches any mutating word at a token boundary. */
 export const NEVER_CACHE_PATTERNS: RegExp[] = [
-  new RegExp(`(^|[_\\-.])(${MUTATING_VERBS.join('|')})([_\\-.]|$)`, 'i'),
+  new RegExp(`(^|[_\\-.])(${[...STRONG_SET, ...WEAK_SET].join('|')})([_\\-.]|$)`, 'i'),
 ];
+
+/**
+ * Is there positive evidence this tool is free of side effects? Unknown names count as
+ * "no": a wrong "yes" silently swallows a side effect on a cache hit, a wrong "no" only
+ * costs a cache miss.
+ *
+ * Evidence, in order: explicit MCP annotations; a well-known read tool; a read verb as the
+ * first word (or second, after a prefix like "git_" / "slack_") with no strong mutating
+ * word and no conjunction anywhere in the name.
+ */
+export function looksReadOnly(toolName: string, hints?: CacheHints): boolean {
+  if (hints?.readOnlyHint === true) return true;
+  if (hints?.readOnlyHint === false || hints?.destructiveHint === true) return false;
+  if (Object.hasOwn(ALWAYS_CACHE_DEFAULTS, toolName)) return true;
+
+  const tokens = tokenizeToolName(toolName);
+  if (tokens.length === 0) return false;
+  if (tokens.some((t) => STRONG_SET.has(t) || CONJUNCTIONS.has(t))) return false;
+  if (MUTATING_PREFIXES.some((p) => tokens[0].startsWith(p))) return false;
+  if (READ_VERBS.has(tokens[0])) return true;
+  return tokens.length > 1 && READ_VERBS.has(tokens[1]) && !tokens.some((t) => WEAK_SET.has(t));
+}
 
 /** Built-in TTLs (seconds) for well-known tools. Overridden by tool_ttls and server_ttls. */
 export const ALWAYS_CACHE_DEFAULTS: Record<string, number> = {
@@ -130,19 +173,19 @@ export class ResponseCache {
 
   /**
    * Decide whether a tool's responses may be cached.
-   * Order: user never_cache > explicit MCP annotations > name heuristics.
+   * Order: user never_cache > annotations saying it has side effects > an explicit
+   * tool_ttls entry (the user opted in) > read-only evidence (see looksReadOnly).
    */
-  shouldCache(toolName: string, hints?: CacheHints): boolean {
+  shouldCache(toolName: string, hints?: CacheHints, serverName?: string): boolean {
     for (const pattern of this.userNeverCache) {
       if (pattern.test(toolName)) return false;
     }
-    if (hints?.readOnlyHint === true) return true;
     if (hints?.readOnlyHint === false || hints?.destructiveHint === true) return false;
-
-    const tokens = tokenizeToolName(toolName);
-    if (tokens.length === 0) return false;
-    if (READ_VERBS.has(tokens[0])) return true;
-    return !tokens.some((t) => MUTATING_SET.has(t));
+    const ttls = this.config.tool_ttls;
+    if (ttls && (Object.hasOwn(ttls, toolName) || (serverName !== undefined && Object.hasOwn(ttls, `${serverName}__${toolName}`)))) {
+      return true;
+    }
+    return looksReadOnly(toolName, hints);
   }
 
   /** Current write generation for a server; pass it back to set() to drop results that raced a write. */

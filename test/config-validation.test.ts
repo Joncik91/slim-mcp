@@ -79,3 +79,15 @@ describe('expandString', () => {
     expect(missing).toEqual(['SLIM_NOPE']);
   });
 });
+
+describe('explicit null means unset (backwards compatible)', () => {
+  it('accepts null optional fields', () => {
+    const cfg = parseConfig({
+      servers: { a: { command: 'x', env: null, args: null, cache_ttl: null } },
+      dashboard: null, cache: null, max_tools_loaded: null,
+    }, SRC);
+    expect(cfg.servers.a).toEqual({ command: 'x', args: [] });
+    expect(cfg.dashboard).toBeUndefined();
+    expect(cfg.cache).toBeUndefined();
+  });
+});

@@ -324,15 +324,19 @@ The resolved TTLs are:
 
 ## Built-in Caching Behaviors
 
-### Never-cache rules
+### Which tools are cached
 
-A tool is **never cached** (and every call to it invalidates that server's cached reads) when, in order:
+Caching is **opt-in by evidence**: a tool is cached only when something says it is a read. A wrongly cached write would silently skip its side effect; a wrongly uncached read only costs a miss. First match wins:
 
-1. Its name matches a user `never_cache` pattern (case-insensitive regex), or
-2. The upstream tool declares `annotations.readOnlyHint: false` or `annotations.destructiveHint: true` (a `readOnlyHint: true` annotation makes it cacheable instead), or
-3. Its name contains a mutating verb as a whole word -- `create`, `write`, `update`, `delete`, `remove`, `set`, `put`, `post`, `patch`, `send`, `submit`, `commit`, `push`, `exec`, `run`, `invoke`, `apply`, `deploy`, `click`, and more -- unless the name *starts* with a read verb (`get`, `list`, `read`, `search`, `find`, `describe`, `fetch`, `show`, `view`, `query`, ...).
+1. Name matches a user `never_cache` pattern (case-insensitive regex) → **not cached**.
+2. The upstream tool declares `annotations.readOnlyHint: false` or `destructiveHint: true` → **not cached**.
+3. `cache.tool_ttls` has an entry for it (bare or `server__tool`) → **cached** (you opted in).
+4. `annotations.readOnlyHint: true` → **cached**.
+5. A well-known read tool (the built-in TTL table below) → **cached**.
+6. Name heuristic → **cached** only if the first word (or the second, after a prefix such as `git_` or `slack_`) is a read verb (`get`, `list`, `read`, `search`, `find`, `describe`, `fetch`, `show`, `view`, `query`, ...) and the name contains no mutating word (`create`, `update`, `delete`, `set`, `send`, `close`, `cancel`, `mark`, `pay`, ...) and no `and`/`or`/`then`.
+7. Anything else → **not cached**.
 
-Names are split on `_`, `-`, `.` and camelCase, so `write_file`, `issue_create`, `createIssue` and `git_commit` are excluded, while `calculate_total`, `postgres_schema` and `get_commit` stay cacheable.
+Names are split on `_`, `-`, `.` and camelCase. So `get_commit`, `list_branches` and `slack_list_channels` are cached; `issue_create`, `createissue`, `get_or_create_user`, `read_and_mark_email`, and unknown names like `calculate_total` or `pay_invoice` are not. Every call to a non-cached tool invalidates that server's cached reads.
 
 A cached read that was in flight when a write hit the same server is discarded rather than stored.
 

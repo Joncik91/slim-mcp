@@ -108,6 +108,8 @@ function makeLazy(enabled: boolean, maxTools: number, alwaysLoad: Set<string>): 
 interface PendingRequest {
   method: string;
   ticket?: CallTicket;
+  /** tools/list request carried a cursor (a later page). */
+  cursor?: boolean;
 }
 
 /** Tracks agent → upstream requests by id until the upstream answers. */
@@ -146,6 +148,8 @@ async function startSingleServerProxy(options: SingleServerOptions): Promise<voi
   const resolve = (toolName: string): ResolvedTool => ({ server: SINGLE_SERVER_KEY, tool: toolName });
   const pipeline = new ToolPipeline({ level, cache, lazy: null, resolve });
   const pending = new PendingRequests();
+  let sawPagination = false;
+  let listedTools = 0;
 
   const upstream = new StdioClientTransport({
     command: options.command,
@@ -181,18 +185,19 @@ async function startSingleServerProxy(options: SingleServerOptions): Promise<voi
           }
         } else if (req.method === 'tools/list' && Array.isArray(result.tools)) {
           const tools = result.tools as Tool[];
-          const paginated = typeof result.nextCursor === 'string';
-          if (!lazyDisabled && !pipeline.lazyManager && !paginated && tools.length > LAZY_AUTO_THRESHOLD) {
+          const paginated = req.cursor === true || typeof result.nextCursor === 'string';
+          // Lazy loading needs the whole tool set; a paginated server never gets it.
+          if (paginated) sawPagination = true;
+          if (!lazyDisabled && !sawPagination && !pipeline.lazyManager && tools.length > LAZY_AUTO_THRESHOLD) {
             pipeline.setLazyManager(makeLazy(true, maxTools, new Set()));
           }
-          if (paginated && pipeline.lazyManager) {
-            debug('Paginated tools/list: lazy loading skipped for this page');
+          if (sawPagination && pipeline.lazyManager) {
+            debug('Paginated tools/list: lazy loading disabled');
+            pipeline.setLazyManager(null);
           }
-          const lazy = pipeline.lazyManager;
-          if (paginated) pipeline.setLazyManager(null);
-          const transformed = pipeline.transformToolList(tools);
-          if (paginated) pipeline.setLazyManager(lazy);
-          stats.registerServer({ name: serverLabel, transport: 'stdio', tools: tools.length, status: 'connected' });
+          const transformed = pipeline.transformToolList(tools, { append: req.cursor === true, paginated: sawPagination });
+          listedTools = req.cursor === true ? listedTools + tools.length : tools.length;
+          stats.registerServer({ name: serverLabel, transport: 'stdio', tools: listedTools, status: 'connected' });
           out = { ...message, result: { ...result, tools: transformed } };
         } else if (req.method === 'tools/call' && req.ticket) {
           pipeline.completeCall(req.ticket, { result });
@@ -220,7 +225,8 @@ async function startSingleServerProxy(options: SingleServerOptions): Promise<voi
         }
         pending.track(message.id, { method: message.method, ticket: decision.ticket });
       } else {
-        pending.track(message.id, { method: message.method });
+        const cursor = message.method === 'tools/list' && typeof (message.params as { cursor?: unknown } | undefined)?.cursor === 'string';
+        pending.track(message.id, cursor ? { method: message.method, cursor } : { method: message.method });
       }
     } else if (isJSONRPCNotification(message) && message.method === 'notifications/cancelled') {
       const requestId = (message.params as { requestId?: RequestId } | undefined)?.requestId;
@@ -235,7 +241,9 @@ async function startSingleServerProxy(options: SingleServerOptions): Promise<voi
   downstream.onerror = (err: Error) => error(`Downstream error: ${err.message}`);
 
   let dashboard: DashboardHandle | null = null;
+  let stopping = false;
   const shutdown = installShutdown(async () => {
+    stopping = true;
     for (const req of pending.drain()) {
       if (req.ticket) pipeline.abandonCall(req.ticket);
     }
@@ -245,8 +253,9 @@ async function startSingleServerProxy(options: SingleServerOptions): Promise<voi
   });
 
   upstream.onclose = () => {
-    debug('Upstream closed');
-    shutdown(0);
+    if (stopping) return;
+    warn('Upstream server exited unexpectedly');
+    shutdown(1);
   };
   downstream.onclose = () => {
     debug('Downstream closed');
@@ -337,8 +346,11 @@ async function startMultiServerProxy(options: MultiServerOptions): Promise<void>
     }`,
   );
 
+  // With one connected server, cache keys use its real name so server_ttls/cache_ttl apply.
+  const soleServer = useNamespace ? undefined : connected[0]?.name;
+  const cacheServerKey = (name: string) => (useNamespace ? name : soleServer ?? SINGLE_SERVER_KEY);
   const resolve = (toolName: string): ResolvedTool => {
-    if (!useNamespace) return { server: SINGLE_SERVER_KEY, tool: toolName };
+    if (!useNamespace) return { server: soleServer ?? SINGLE_SERVER_KEY, tool: toolName };
     const parsed = parseNamespacedToolName(toolName);
     return { server: parsed.serverName || '_unknown', tool: parsed.toolName };
   };
@@ -365,7 +377,7 @@ async function startMultiServerProxy(options: MultiServerOptions): Promise<void>
   manager.onEvent((event) => {
     const srv = manager.servers.get(event.server);
     if (!srv) return;
-    cache?.invalidateServer(useNamespace ? srv.name : SINGLE_SERVER_KEY);
+    cache?.invalidateServer(cacheServerKey(srv.name));
     stats.registerServer({
       name: srv.name,
       transport: srv.transport,

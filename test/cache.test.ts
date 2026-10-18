@@ -97,9 +97,18 @@ describe('shouldCache', () => {
     }
   });
 
-  it('returns true for unknown tools not in never-cache list', () => {
-    expect(cache.shouldCache('my_custom_lookup')).toBe(true);
-    expect(cache.shouldCache('analyze_data')).toBe(true);
+  it('does not cache unknown tool names unless the user opts in via tool_ttls', () => {
+    expect(cache.shouldCache('my_custom_lookup')).toBe(false);
+    expect(cache.shouldCache('analyze_data')).toBe(false);
+    const c = new ResponseCache(makeConfig({ tool_ttls: { analyze_data: 30, 'srv__my_custom_lookup': 10 } }));
+    expect(c.shouldCache('analyze_data')).toBe(true);
+    expect(c.shouldCache('my_custom_lookup', undefined, 'srv')).toBe(true);
+    expect(c.shouldCache('my_custom_lookup', undefined, 'other')).toBe(false);
+  });
+
+  it('an explicit tool_ttls entry never overrides a destructive annotation', () => {
+    const c = new ResponseCache(makeConfig({ tool_ttls: { purge: 30 } }));
+    expect(c.shouldCache('purge', { destructiveHint: true })).toBe(false);
   });
 
   it('custom never_cache list in config blocks specific tools', () => {
@@ -430,7 +439,7 @@ describe('token-based classification', () => {
   const cache = new ResponseCache(makeConfig());
 
   it('does not treat verb-prefixed nouns as writes', () => {
-    for (const tool of ['calculate_total', 'postgres_schema', 'settings_list', 'runtime_info', 'address_lookup']) {
+    for (const tool of ['get_calculated_total', 'get_postgres_schema', 'list_settings', 'get_runtime_info', 'lookup_address']) {
       expect(cache.shouldCache(tool), tool).toBe(true);
     }
   });
@@ -509,4 +518,24 @@ describe('edge cases', () => {
   it('hash is a full SHA-256 digest (no 32-bit collisions)', () => {
     expect(stableHash({ a: 1 })).toHaveLength(43);
   });
+});
+
+describe('classification table (review regressions)', () => {
+  const cache = new ResponseCache(makeConfig());
+  const writes = [
+    'createissue', 'updatefile', 'executesql', 'starttask', 'setup_project', 'slack_archive_channel',
+    'slack_invite_user', 'get_or_create_user', 'find_and_replace', 'close_issue', 'browser_fill_form',
+    'cancel_job', 'set_status', 'slack_post',
+  ];
+  const reads = [
+    'read_file', 'list_directory', 'get_commit', 'list_branches', 'get_run_status', 'git_status', 'git_diff',
+    'search_messages', 'get_schedule', 'git_show', 'slack_list_channels',
+  ];
+  const unknown = [
+    'calculate_total', 'postgres_schema', 'browser_snapshot', 'pay_invoice', 'refund', 'toggle_flag',
+    'read_and_mark_email', 'mark_as_read', 'order', 'book_flight', 'dismiss', 'request_review',
+  ];
+  for (const t of unknown) it(`does not cache ${t} (no read evidence)`, () => expect(cache.shouldCache(t)).toBe(false));
+  for (const t of writes) it(`never caches ${t}`, () => expect(cache.shouldCache(t)).toBe(false));
+  for (const t of reads) it(`caches ${t}`, () => expect(cache.shouldCache(t)).toBe(true));
 });
