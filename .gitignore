@@ -2,7 +2,7 @@ node_modules/
 dist/
 .env
 *.tgz
-.tmp-e2e
+.tmp-e2e*
 scripts/smoke-test-real.json
 scripts/smoke-test-*.local.json
 *.bak

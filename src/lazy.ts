@@ -31,14 +31,21 @@ export const HIGH_PRIORITY_PATTERNS = /^(search|list|read|get|find|describe|info
 
 // --- Helpers ---
 
-function slimTool(tool: Tool): Tool {
-  const slim: Tool = {
-    name: tool.name,
-    inputSchema: { type: 'object' as const },
-  };
-  if (tool.description) {
-    slim.description = tool.description;
-  }
+/** Bare tool name, without a `server__` namespace prefix. */
+function bareName(name: string): string {
+  const sep = name.indexOf('__');
+  return sep > 0 ? name.slice(sep + 2) : name;
+}
+
+export function isHighPriority(name: string): boolean {
+  return HIGH_PRIORITY_PATTERNS.test(bareName(name));
+}
+
+/** Index-only view of a tool: schemas dropped; identity, safety and other metadata kept. */
+export function slimTool(tool: Tool): Tool {
+  const { inputSchema: _i, outputSchema: _o, description, ...rest } = tool;
+  const slim: Tool = { ...rest, inputSchema: { type: 'object' as const } };
+  if (description) slim.description = description;
   return slim;
 }
 
@@ -92,7 +99,7 @@ export function createLazyToolManager(options: {
       for (const tool of allTools) {
         if (filled >= remaining) break;
         if (fullNames.has(tool.name)) continue;
-        if (HIGH_PRIORITY_PATTERNS.test(tool.name)) {
+        if (isHighPriority(tool.name)) {
           fullNames.add(tool.name);
           filled++;
         }
@@ -125,7 +132,9 @@ export function createLazyToolManager(options: {
   function promoteTools(toolNames: string[]): void {
     for (const name of toolNames) {
       promoted.add(name);
-      slimSet.delete(name);
+      if (slimSet.delete(name) && lastStats) {
+        lastStats = { ...lastStats, loaded: lastStats.loaded + 1, slim: lastStats.slim - 1 };
+      }
     }
   }
 

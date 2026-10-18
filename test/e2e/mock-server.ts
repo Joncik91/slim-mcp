@@ -5,8 +5,10 @@ import { z } from 'zod';
 
 const args = process.argv.slice(2);
 let toolCount = 25;
+let addToolAfterMs: number | undefined;
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--tools') toolCount = parseInt(args[++i], 10);
+  else if (args[i] === '--add-tool-after') addToolAfterMs = parseInt(args[++i], 10);
 }
 
 const READ_PREFIXES = ['read_data', 'get_info', 'list_items', 'search_records', 'find_match', 'describe_schema'];
@@ -46,4 +48,13 @@ for (let i = 0; i < toolCount; i++) {
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
+
+// Registering a tool after connect makes the SDK emit notifications/tools/list_changed.
+if (addToolAfterMs !== undefined) {
+  setTimeout(() => {
+    server.tool('late_tool', 'Registered after startup', { input: z.string() }, async ({ input }) => ({
+      content: [{ type: 'text' as const, text: `late:${input}` }],
+    }));
+  }, addToolAfterMs);
+}
 process.stderr.write(`mock-server ready with ${toolCount} tools\n`);

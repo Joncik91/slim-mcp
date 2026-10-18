@@ -1,4 +1,4 @@
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
@@ -6,9 +6,8 @@ import { debug } from '../logger.js';
 
 export type TransportType = 'http' | 'sse';
 
-export interface HttpTransportResult {
-  transport: Transport;
-  detectedType: TransportType;
+function requestOptions(headers?: Record<string, string>): { requestInit: RequestInit } | undefined {
+  return headers && Object.keys(headers).length > 0 ? { requestInit: { headers } } : undefined;
 }
 
 /**
@@ -20,52 +19,41 @@ export function createTypedTransport(
   headers?: Record<string, string>,
 ): Transport {
   const parsedUrl = new URL(url);
-  const requestInit: RequestInit | undefined =
-    headers && Object.keys(headers).length > 0 ? { headers } : undefined;
-
-  if (type === 'sse') {
-    return new SSEClientTransport(
-      parsedUrl,
-      requestInit ? { requestInit } : undefined,
-    );
-  }
-  return new StreamableHTTPClientTransport(
-    parsedUrl,
-    requestInit ? { requestInit } : undefined,
-  );
+  const opts = requestOptions(headers);
+  return type === 'sse'
+    ? new SSEClientTransport(parsedUrl, opts)
+    : new StreamableHTTPClientTransport(parsedUrl, opts);
 }
 
 /**
- * Auto-detect: try Streamable HTTP connection first, fall back to SSE.
+ * Auto-detect: try Streamable HTTP first, fall back to legacy SSE.
  *
- * This actually connects the client — the caller should NOT call
- * `client.connect()` again after this returns.
+ * A Client cannot be reused after a failed connect (its close() is asynchronous),
+ * so the fallback runs on a fresh Client from `makeClient`. The connected client
+ * is whichever `makeClient` returned last (or `first` if HTTP succeeded).
  */
 export async function connectWithAutoDetect(
-  client: Client,
   url: string,
-  headers?: Record<string, string>,
+  headers: Record<string, string> | undefined,
+  makeClient: () => Client,
+  first: Client,
 ): Promise<TransportType> {
-  const parsedUrl = new URL(url);
-  const requestInit: RequestInit | undefined =
-    headers && Object.keys(headers).length > 0 ? { headers } : undefined;
-
   try {
     debug(`Auto-detecting transport for ${url} — trying Streamable HTTP...`);
-    const httpTransport = new StreamableHTTPClientTransport(
-      parsedUrl,
-      requestInit ? { requestInit } : undefined,
-    );
-    await client.connect(httpTransport);
+    await first.connect(createTypedTransport(url, 'http', headers));
     debug(`Connected to ${url} via Streamable HTTP`);
     return 'http';
-  } catch {
-    debug(`Streamable HTTP failed for ${url} — falling back to SSE`);
-    const sseTransport = new SSEClientTransport(
-      parsedUrl,
-      requestInit ? { requestInit } : undefined,
-    );
-    await client.connect(sseTransport);
+  } catch (httpErr) {
+    debug(`Streamable HTTP failed for ${url} (${httpErr instanceof Error ? httpErr.message : String(httpErr)}) — falling back to SSE`);
+    await first.close().catch(() => {});
+    const fallback = makeClient();
+    try {
+      await fallback.connect(createTypedTransport(url, 'sse', headers));
+    } catch (sseErr) {
+      const h = httpErr instanceof Error ? httpErr.message : String(httpErr);
+      const s = sseErr instanceof Error ? sseErr.message : String(sseErr);
+      throw new Error(`Streamable HTTP failed (${h}); SSE fallback failed (${s})`);
+    }
     debug(`Connected to ${url} via SSE`);
     return 'sse';
   }

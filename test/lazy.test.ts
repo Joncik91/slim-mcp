@@ -415,3 +415,27 @@ describe('order preservation', () => {
     expect(result.map(t => t.name)).toEqual(['beta', 'delta', 'alpha', 'search_gamma']);
   });
 });
+
+describe('namespaced tools', () => {
+  it('priority patterns match the bare name after the server prefix', () => {
+    const mgr = createLazyToolManager({ maxToolsLoaded: 1, alwaysLoad: new Set() });
+    mgr.getToolList([makeTool('gh__create_issue'), makeTool('gh__search_issues')]);
+    expect(mgr.isSlim('gh__search_issues')).toBe(false);
+    expect(mgr.isSlim('gh__create_issue')).toBe(true);
+  });
+
+  it('slim entries keep annotations so clients still see safety hints', () => {
+    const mgr = createLazyToolManager({ maxToolsLoaded: 0, alwaysLoad: new Set() });
+    const tool = { ...makeTool('delete_all'), annotations: { destructiveHint: true } };
+    const [slim] = mgr.getToolList([tool]);
+    expect(slim.annotations).toEqual({ destructiveHint: true });
+    expect(slim.inputSchema).toEqual({ type: 'object' });
+  });
+
+  it('stats reflect a promotion immediately', () => {
+    const mgr = createLazyToolManager({ maxToolsLoaded: 0, alwaysLoad: new Set() });
+    mgr.getToolList([makeTool('a'), makeTool('b')]);
+    mgr.promoteTools(['a']);
+    expect(mgr.getStats()).toEqual({ total: 2, loaded: 1, slim: 1 });
+  });
+});

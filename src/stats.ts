@@ -42,6 +42,8 @@ export interface ToolCallRecord {
   server: string;
   cached: boolean;
   promoted: boolean;
+  /** Upstream failure, JSON-RPC error, cancellation or isError result. */
+  error: boolean;
   timestamp: string;
   durationMs: number;
 }
@@ -68,6 +70,7 @@ export type StatsEvent =
   | { type: 'tool_call'; data: ToolCallRecord }
   | { type: 'promotion'; data: { tool: string; timestamp: string } }
   | { type: 'cache_invalidation'; data: { server: string; timestamp: string } }
+  | { type: 'server_status'; data: ServerInfo }
   | { type: 'stats_update'; data: Partial<SlimMcpStats> };
 
 type EventListener = (event: StatsEvent) => void;
@@ -99,8 +102,8 @@ class StatsCollector {
   }
 
   private emit(event: StatsEvent): void {
-    for (const l of this.listeners) {
-      try { l(event); } catch {}
+    for (const l of [...this.listeners]) {
+      try { l(event); } catch { /* a broken listener must not break stats */ }
     }
   }
 
@@ -109,6 +112,7 @@ class StatsCollector {
     const existing = this.servers.findIndex(s => s.name === info.name);
     if (existing >= 0) this.servers[existing] = info;
     else this.servers.push(info);
+    this.emit({ type: 'server_status', data: { ...info } });
   }
 
   // --- Compression ---

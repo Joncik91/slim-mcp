@@ -44,10 +44,24 @@ describe('lazy loading', () => {
     const slimTool = tools.find(t => !((t.inputSchema as any).properties));
     expect(slimTool).toBeDefined();
 
-    const result = await harness.client.callTool({ name: slimTool!.name, arguments: { input: 'test' } });
+    // Missing the required "input" argument → rejected with the full schema attached
+    const result = await harness.client.callTool({ name: slimTool!.name, arguments: {} });
     expect(result.isError).toBe(true);
     const text = (result.content as any[])[0].text;
     expect(text.toLowerCase()).toContain('retry');
+    expect(text).toContain('"inputSchema"');
+    expect(text).toContain('"input"');
+  });
+
+  it('calling a slim tool with valid arguments promotes and forwards in one round trip', async () => {
+    harness = await startHarness(['--max-tools', '3', '--', 'npx', 'tsx', MOCK_SERVER, '--tools', '25']);
+    const { tools } = await harness.client.listTools();
+    const slimTool = tools.find(t => !((t.inputSchema as any).properties));
+    expect(slimTool).toBeDefined();
+
+    const result = await harness.client.callTool({ name: slimTool!.name, arguments: { input: 'first-try' } });
+    expect(result.isError).toBeFalsy();
+    expect((result.content as any[])[0].text).toContain('first-try');
   });
 
   it('promoted tool has full schema on next listTools', async () => {
@@ -58,7 +72,7 @@ describe('lazy loading', () => {
     const slimTool = tools.find(t => !((t.inputSchema as any).properties));
     expect(slimTool).toBeDefined();
 
-    await harness.client.callTool({ name: slimTool!.name, arguments: { input: 'test' } });
+    await harness.client.callTool({ name: slimTool!.name, arguments: {} });
 
     // Re-list -- promoted tool should now have full schema
     const result = await harness.client.listTools();
@@ -75,7 +89,8 @@ describe('lazy loading', () => {
     expect(slimTool).toBeDefined();
 
     // First call -- error + promotion
-    await harness.client.callTool({ name: slimTool!.name, arguments: { input: 'test' } });
+    const first = await harness.client.callTool({ name: slimTool!.name, arguments: {} });
+    expect(first.isError).toBe(true);
 
     // Re-list to get full schema
     await harness.client.listTools();

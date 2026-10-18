@@ -131,11 +131,11 @@ slim-mcp speaks standard MCP over stdio. Works with Cursor, Windsurf, or any cli
 | Feature | How it works | When it activates |
 |---------|-------------|-------------------|
 | **Compression** | 5 levels from structural cleanup to TS-signature embedding | Always (default: `standard`) |
-| **Lazy loading** | Slim one-liner indexes for most tools, full schema on first call | Auto when >15 tools |
-| **Caching** | TTL + LRU for read-only calls, invalidates on writes | Always (disable with `--no-cache`) |
+| **Lazy loading** | Slim one-liner indexes for most tools; first call goes through if its arguments already fit the schema, otherwise returns the schema for a retry | Auto when >15 tools |
+| **Caching** | TTL + LRU for read-only calls (MCP `readOnlyHint` aware), invalidates on writes | Always (disable with `--no-cache`) |
 | **Multi-server** | Aggregates servers behind one proxy, namespaces as `server__tool` | Config file with 2+ servers |
 | **Remote transport** | HTTP/SSE alongside local stdio servers | `url` in config or `--url` flag |
-| **Live dashboard** | Real-time stats: compression, cache hits, tool calls, server status | Multi-server mode (port 7333) |
+| **Live dashboard** | Real-time stats: compression, cache hits, tool calls, server status | Multi-server mode, or `--dashboard-port` (127.0.0.1:7333) |
 
 ### Compression Levels
 
@@ -149,17 +149,17 @@ slim-mcp speaks standard MCP over stdio. Works with Cursor, Windsurf, or any cli
 
 ### Dashboard
 
-When running in multi-server mode, slim-mcp serves a live web dashboard:
+When running in multi-server mode (or with `--dashboard-port` in single-server mode), slim-mcp serves a live web dashboard on loopback:
 
 ```
 http://localhost:7333
 ```
 
-Shows: token savings, cache hit rate, server status, recent tool calls with HIT/MISS/PROMOTED status and response times. Updates in real-time via SSE. Dark theme, zero dependencies.
+Shows: token savings, cache hit rate, server status (connected / failed / disconnected), recent tool calls with HIT/MISS/PROMOTED/ERROR status and response times. Updates in real-time via SSE. Dark theme, zero dependencies.
 
 Enable via config:
 ```json
-{ "dashboard": { "enabled": true, "port": 7333 } }
+{ "dashboard": { "enabled": true, "port": 7333, "host": "127.0.0.1" } }
 ```
 
 Or CLI: `--dashboard-port 7333`. Disable: `--no-dashboard`.
@@ -197,7 +197,7 @@ slim-mcp looks for `.slim-mcp.json` in the working directory, then home director
 }
 ```
 
-Each server needs `command` (stdio) or `url` (HTTP/SSE), not both. Environment variables expand with `${VAR}` syntax.
+Each server needs `command` (stdio) or `url` (HTTP/SSE), not both. Environment variables expand with `${VAR}` or `${VAR:-default}` syntax.
 
 Full reference in [docs/configuration.md](docs/configuration.md).
 
@@ -235,7 +235,9 @@ Agent <--stdio--> slim-mcp ----+-- Server B (stdio)
 
 On `tools/list`: collect from all servers -> lazy load (slim/full split) -> compress -> return.
 
-On `tools/call`: check if slim (promote + retry) -> check cache (return if hit) -> route to server -> cache result.
+On `tools/call`: if slim, promote (and forward if the arguments fit the schema, else return the schema) -> check cache (return if hit) -> route to server -> cache result.
+
+Upstream `tools/list_changed` notifications and crashed servers are followed live; the agent is notified. The proxy exits when the agent closes stdin and takes its child servers down with it.
 
 All logging to stderr. Protocol channel stays clean.
 
@@ -243,7 +245,7 @@ Architecture deep dive in [docs/how-it-works.md](docs/how-it-works.md).
 
 ## Testing
 
-220 tests: 190 unit + 30 e2e. Plus accuracy tests and smoke tests against real servers.
+297 tests: 261 unit + 36 e2e. Plus accuracy tests and smoke tests against real servers.
 
 ```bash
 npm test              # Unit tests
