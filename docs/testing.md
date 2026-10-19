@@ -143,8 +143,8 @@ The smoke test never modifies `~/.claude.json` (the manual setup script does, bu
 
 ```
 220+ tests total
-├── 190 unit tests    (10 files, ~65s)
-├──  30 e2e tests     (5 files, ~110s)
+├── 297 unit tests    (13 files, ~65s)
+├──  36 e2e tests     (6 files, ~50s)
 ├──   2 smoke tests   (single-server + multi-server)
 └── 120 accuracy tests (8 scenarios × 5 levels × 3 runs, via Anthropic API)
 ```

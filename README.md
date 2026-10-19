@@ -8,7 +8,7 @@
 [![Node.js 18+](https://img.shields.io/badge/node-18%2B-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-E8954A.svg)](LICENSE)
-[![tests: 220](https://img.shields.io/badge/tests-220%20%C2%B7%20190%20unit%20%2B%2030%20e2e-E8954A)]()
+[![tests: 333](https://img.shields.io/badge/tests-333%20%C2%B7%20297%20unit%20%2B%2036%20e2e-E8954A)]()
 [![accuracy: 100%](https://img.shields.io/badge/accuracy-100%25%20%C2%B7%20120%20API%20calls-E8954A)]()
 [![reduction: 77%](https://img.shields.io/badge/token%20reduction-up%20to%2077%25-E8954A)]()
 
@@ -245,7 +245,7 @@ Architecture deep dive in [docs/how-it-works.md](docs/how-it-works.md).
 
 ## Testing
 
-297 tests: 261 unit + 36 e2e. Plus accuracy tests and smoke tests against real servers.
+333 tests: 297 unit + 36 e2e. Plus accuracy tests and smoke tests against real servers.
 
 ```bash
 npm test              # Unit tests
